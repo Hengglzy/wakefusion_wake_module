@@ -1,0 +1,50 @@
+# WakeFusion 唤醒模块依赖
+
+# 音频处理
+pyaudio>=0.2.13
+numpy>=1.24.0
+
+# KWS (Keyword Spotting)
+openwakeword>=0.6.0          # 备选方案1（需要训练）
+sherpa-onnx>=1.10.0          # 备选方案2：中文唤醒词，无需训练
+pvporcupine>=1.9.0           # 备选方案3：商业方案（需要Access Key）
+
+# MatchboxNet (NeMo) - 主要方案
+nemo-toolkit[asr]>=1.14.0    # NVIDIA NeMo 框架（包含 MatchboxNet）
+torch>=2.0.0                 # PyTorch（NeMo 依赖）
+torchaudio>=2.0.0            # PyTorch Audio
+librosa>=0.10.0              # 音频特征提取
+soundfile>=0.12.0            # 音频文件读写
+
+# VAD (Voice Activity Detection)
+webrtcvad>=2.0.10
+
+# 视觉处理（Phase 2）
+pyorbbecsdk>=0.1.0  # Femto Bolt SDK
+
+# 数据处理
+pydantic>=2.0
+
+# 异步框架
+aiohttp>=3.9.0
+websockets>=11.0
+
+# 配置管理
+pyyaml>=6.0
+
+# 系统监控
+psutil>=5.9.0
+
+# 日志
+colorlog>=6.7.0
+
+# 训练模块依赖（自动化训练）
+edge-tts>=6.1.0              # TTS生成（免费）
+pytorch-lightning>=2.0.0      # PyTorch Lightning（NeMo训练）
+omegaconf>=2.3.0             # 配置管理（NeMo依赖）
+onnxruntime>=1.16.0          # ONNX推理
+
+# 开发依赖 (可选)
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0

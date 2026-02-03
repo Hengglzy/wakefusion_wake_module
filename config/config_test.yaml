@@ -1,0 +1,48 @@
+# WakeFusion 配置文件 - 测试模式（使用Windows默认麦克风）
+
+# 音频配置
+audio:
+  device_match: "default"  # 使用系统默认麦克风
+  capture_sample_rate: 48000  # 采集采样率
+  work_sample_rate: 16000  # 工作采样率
+  frame_ms: 20  # 帧长（毫秒）
+  ring_buffer_sec: 2.0  # Ring buffer长度（秒）
+  pre_roll_ms: 800  # Pre-roll时长（毫秒）
+  channels: 1  # 声道数
+
+# KWS配置
+kws:
+  enabled: true
+  model: "openwakeword"
+  keyword: "hey_assistant"  # 唤醒词
+  threshold: 0.55  # 检测阈值
+  cooldown_ms: 1200  # 冷却时长（毫秒）
+
+# VAD配置
+vad:
+  enabled: true
+  model: "webrtcvad"
+  speech_start_ms: 120  # 语音起始阈值（毫秒）
+  speech_end_ms: 500  # 语音结束阈值（毫秒）
+
+# 视觉配置（硬件未到，禁用）
+vision:
+  enabled: false  # 禁用视觉组件
+  gate_on_kws_only: true
+  cache_ms: 600
+  target_fps: 15
+  distance_m_max: 4.0
+  face_conf_min: 0.55
+
+# 融合策略配置
+fusion:
+  probation_enabled: true  # 是否启用降级策略
+  probation_ms: 1000  # 降级窗口（毫秒）
+  barge_in_enabled: true  # 是否启用打断
+
+# 运行时配置
+runtime:
+  health_interval_sec: 2  # 健康检查间隔（秒）
+  log_level: "INFO"
+  websocket_port: 8765  # WebSocket端口
+  health_port: 8080  # 健康检查端口
