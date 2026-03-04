@@ -1,4 +1,4 @@
-# Python
+# ===================== Python 通用 =====================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -20,26 +20,78 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# ===================== 虚拟环境 =====================
 venv/
 ENV/
 env/
 
-# IDE
+# ===================== IDE =====================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.cursor/
 
-# Logs
-*.log
-
-# OS
+# ===================== 系统文件 =====================
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Project specific
-config/local.yaml
+# ===================== 日志 =====================
+*.log
+
+# ===================== 训练模型（大文件）=====================
+# NeMo 模型
+*.nemo
+
+# ONNX 模型（根目录的 OWW 训练模型）
+xiaokang_*.onnx
+
+# MediaPipe / 视觉模型
+gesture_recognizer.task
+
+# 训练 checkpoint
+checkpoints/
+training_checkpoints/
+lightning_logs/
+logs/
+
+# ===================== 音频数据（大文件）=====================
+# 所有音频文件
 *.wav
- recordings/
+*.mp3
+*.flac
+*.ogg
+
+# 音频数据集目录
+custom_dataset/
+real_audio/
+data/
+results/
+
+# MP3 目录中的音频文件（保留 .py 脚本）
+MP3/*.mp3
+
+# TTS 临时生成目录
+_temp_tts_base/
+
+# 数据集压缩包
+custom_dataset.zip
+
+# 训练 manifest（由脚本自动生成）
+*_manifest.json
+mixed_finetune_manifest.json
+real_manifest.json
+
+# ===================== 二进制库文件 =====================
+*.dll
+*.pyd
+
+# ===================== 备份 / 临时文件 =====================
+pip_backup.txt
+conda_backup.yml
+test_vision_cosyvoice_compat.py
+
+# ===================== 特征文件 =====================
+*.npy
