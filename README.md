@@ -179,3 +179,35 @@ wakefusion/
 ## License
 
 MIT
+
+
+为什么建议彻底卸载 MediaPipe？
+是的，建议卸载。 * 解除封印：MediaPipe 强制要求的 protobuf<4 就像一个枷锁，导致你的 nemo-toolkit（语音模块）和 tensorflow（模型推理）处于随时可能崩溃的亚健康状态。
+
+开发影响：卸载 MediaPipe 不会对后续开发产生负面影响。因为在你的 wakefusion 架构中，FaceGateWorker 是一个独立的组件，只要我们换个底层“引擎”但保持输出格式（返回人脸框和置信度）不变，系统的其他部分（如决策引擎）完全感知不到变化。
+
+替代方案一：OpenCV YuNet（最推荐，零依赖）
+这是目前避开依赖冲突的“银弹”。YuNet 是一个极其轻量且高性能的人脸检测模型。
+
+原理：它是一个 .onnx 格式的模型文件。它不需要安装任何新的 Python 库，直接利用你已经安装好的 opencv-python 的 dnn 模块就能运行。
+
+对比 MediaPipe：
+
+性能：在 CPU 上的速度甚至快于 MediaPipe。
+
+功能：同样支持人脸框（Bounding Box）和 5 个关键点（眼睛、鼻子、嘴角）。
+
+兼容性：因为它是模型文件而不是库，所以完全没有 Protobuf 版本冲突。
+
+实现思路：下载一个 2MB 的 face_detection_yunet.onnx 文件放在 models/ 目录下，在 face_gate.py 中用 cv2.FaceDetectorYN.create() 调用即可。
+
+替代方案二：多进程/微服务隔离（最专业）
+如果你非常喜欢 MediaPipe 的 API，或者未来需要它更复杂的功能（如手势识别），那么“隔离”是唯一出路。
+
+原理：为 MediaPipe 单独创建一个 Conda 环境（比如叫 env_vision）。主程序运行在 wakefusion 环境中，两个环境通过 Socket 或 ZMQ 进行通信。
+
+优点：
+
+版本自由：视觉环境可以用 Protobuf 3.x，语音环境可以用 Protobuf 5.x，互不干扰。
+
+系统稳定性：即使视觉模块因为相机掉线崩了，也不会拖累语音唤醒模块。

@@ -12,33 +12,27 @@ from contextlib import contextmanager
 
 
 class StructuredFormatter(logging.Formatter):
-    """结构化日志格式化器（JSON格式）"""
+    """结构化日志格式化器（文本格式）
+
+    统一输出格式：
+        [Time] [Level] [Logger] -> Message
+    """
 
     def format(self, record: logging.LogRecord) -> str:
-        """格式化日志记录为JSON"""
-        log_data = {
-            "ts": datetime.fromtimestamp(record.created).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-        }
+        """格式化日志记录为简洁的文本格式"""
+        ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+        level = record.levelname
+        logger_name = record.name
+        msg = record.getMessage()
 
-        # 添加额外字段
-        if hasattr(record, 'session_id'):
-            log_data['session_id'] = record.session_id
-        if hasattr(record, 'event_id'):
-            log_data['event_id'] = record.event_id
-        if hasattr(record, 'extra'):
-            log_data.update(record.extra)
+        base = f"[{ts}] [{level}] [{logger_name}] -> {msg}"
 
-        # 异常信息
+        # 若存在异常信息，追加到日志末尾，便于人类阅读
         if record.exc_info:
-            log_data['exception'] = self.formatException(record.exc_info)
+            exc_text = self.formatException(record.exc_info)
+            base = f"{base}\n{exc_text}"
 
-        return json.dumps(log_data, ensure_ascii=False)
+        return base
 
 
 class WakeFusionLogger:

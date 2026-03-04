@@ -1,11 +1,12 @@
 """
 视觉组件测试脚本
-用于验证Femto Bolt相机和视觉门控是否正常工作
+用于验证Orbbec Gemini 330系列相机（335/336）和视觉门控是否正常工作
 """
 
 import asyncio
+import time
 import numpy as np
-from wakefusion.drivers import FemtoBoltDriver, CameraConfig
+from wakefusion.drivers import Gemini330Driver, CameraConfig
 from wakefusion.routers import VisionRouter
 from wakefusion.workers import FaceGateWorker, FaceGateConfig
 from wakefusion.types import VisionFrame
@@ -38,25 +39,30 @@ async def test_camera_driver():
                 if len(valid_depth) > 0:
                     print(f"  - 有效深度范围: {valid_depth.min():.2f}m - {valid_depth.max():.2f}m")
 
-    driver = FemtoBoltDriver(
+    driver = Gemini330Driver(
         config=CameraConfig(
-            rgb_width=640,
-            rgb_height=480,
-            rgb_fps=15,  # 降低帧率
+            rgb_width=1280,   # 匹配深度分辨率
+            rgb_height=800,
+            rgb_fps=15,       # 15FPS 对于展厅交互已经足够流畅
+            depth_width=1280,
+            depth_height=800,
+            depth_fps=15,
             enable_rgb=False,  # 暂时只测试深度
             enable_depth=True
         ),
         callback=on_vision_frame
     )
 
+    capture_task = None
     try:
         print("\n启动相机...")
         driver.start()
+        
+        # 启动后台采集循环（关键修复：确保帧数据被真正采集）
+        capture_task = asyncio.create_task(driver.run_with_reconnect())
+        
         print("采集中... (10秒)")
-
         await asyncio.sleep(10)
-
-        driver.stop()
 
         print(f"\n✓ 采集完成!")
         print(f"  - 总帧数: {frame_count}")
@@ -73,6 +79,17 @@ async def test_camera_driver():
         print("  1. 相机未连接")
         print("  2. pyorbbecsdk未安装")
         print("  3. 驱动问题")
+    finally:
+        # 安全停止采集任务
+        if capture_task and not capture_task.done():
+            capture_task.cancel()
+            try:
+                await capture_task
+            except asyncio.CancelledError:
+                pass
+        
+        # 停止驱动
+        driver.stop()
 
 
 async def test_vision_router():
@@ -88,7 +105,7 @@ async def test_vision_router():
 
     # 生成测试帧
     print("\n生成测试帧...")
-    current_time = asyncio.get_event_loop().time()
+    current_time = time.time()
 
     for i in range(10):
         frame = VisionFrame(
@@ -139,7 +156,7 @@ async def test_face_gate():
 
     # 生成测试帧
     print("\n生成测试帧...")
-    current_time = asyncio.get_event_loop().time()
+    current_time = time.time()
 
     # 帧1: 人在2米处
     frame1 = VisionFrame(
@@ -155,9 +172,9 @@ async def test_face_gate():
     result1 = gate.process_frame(frame1)
     print(f"\n✓ 帧1 (2米处):")
     print(f"  - presence: {result1.presence if result1 else 'N/A'}")
-    print(f"  - distance_m: {result1.distance_m:.2f}m" if result1 else "N/A")
-    print(f"  - valid: {result1.valid if result1 else 'N/A'}" if result1 else "N/A")
-    print(f"  - confidence: {result1.confidence:.2f}" if result1 else "N/A")
+    print(f"  - distance_m: {f'{result1.distance_m:.2f}m' if result1 and result1.distance_m is not None else 'N/A'}")
+    print(f"  - valid: {result1.valid if result1 else 'N/A'}")
+    print(f"  - confidence: {f'{result1.confidence:.2f}' if result1 else 'N/A'}")
 
     # 帧2: 人在5米外（超出范围）
     frame2 = VisionFrame(
@@ -173,8 +190,8 @@ async def test_face_gate():
     result2 = gate.process_frame(frame2)
     print(f"\n✓ 帧2 (5米外):")
     print(f"  - presence: {result2.presence if result2 else 'N/A'}")
-    print(f"  - distance_m: {result2.distance_m:.2f}m" if result2 else "N/A")
-    print(f"  - valid: {result2.valid if result2 else 'N/A'}" if result2 else "N/A")
+    print(f"  - distance_m: {f'{result2.distance_m:.2f}m' if result2 and result2.distance_m is not None else 'N/A'}")
+    print(f"  - valid: {result2.valid if result2 else 'N/A'}")
 
     # 统计
     stats = gate.get_stats()
@@ -192,7 +209,7 @@ async def main():
     print("=" * 60)
 
     # 测试1: 相机驱动（需要硬件）
-    print("\n提示: 相机驱动测试需要Femto Bolt硬件")
+    print("\n提示: 相机驱动测试需要Orbbec Gemini 330系列硬件（335/336）")
     choice = input("是否测试相机驱动? (y/n): ")
     if choice.lower() == 'y':
         await test_camera_driver()

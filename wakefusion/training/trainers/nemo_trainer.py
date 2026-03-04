@@ -63,10 +63,9 @@ class NeMoTrainer:
         """
         try:
             from nemo.collections.asr.models import EncDecClassificationModel
-            from nemo.core.config import HydraConfig
-            from omegaconf import OmegaConf
-            import pytorch_lightning as pl
-            from pytorch_lightning.callbacks import ModelCheckpoint
+            from omegaconf import OmegaConf, DictConfig
+            import lightning.pytorch as pl
+            from lightning.pytorch.callbacks import ModelCheckpoint
 
             logger.info("开始NeMo模型训练")
 
@@ -103,14 +102,14 @@ class NeMoTrainer:
                     'sample_rate': 16000,
                     'batch_size': self.config.batch_size,
                     'shuffle': True,
-                    'num_workers': self.config.num_workers,
+                    'num_workers': 0,  # Windows 下必须设为 0，避免多进程序列化错误
                     'pin_memory': True
                 },
                 'validation_ds': {
                     'manifest_filepath': self.config.val_manifest,
                     'sample_rate': 16000,
                     'batch_size': self.config.batch_size,
-                    'num_workers': self.config.num_workers,
+                    'num_workers': 0,  # Windows 下必须设为 0，避免多进程序列化错误
                     'pin_memory': True
                 },
                 'optim': {

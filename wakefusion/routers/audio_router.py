@@ -37,7 +37,8 @@ class AudioRouter:
         capture_sample_rate: int = 48000,
         work_sample_rate: int = 16000,
         frame_ms: int = 20,
-        ring_buffer_sec: float = 2.0
+        ring_buffer_sec: float = 2.0,
+        rnnoise_enabled: bool = False
     ):
         """
         初始化音频路由器
@@ -47,6 +48,7 @@ class AudioRouter:
             work_sample_rate: 工作采样率（下采样目标）
             frame_ms: 帧长（毫秒）
             ring_buffer_sec: Ring buffer长度（秒）
+            rnnoise_enabled: 是否启用 RNNoise 降噪
         """
         self.capture_sample_rate = capture_sample_rate
         self.work_sample_rate = work_sample_rate
@@ -71,6 +73,22 @@ class AudioRouter:
         self.dropped_frames = 0
         self.last_frame_time: Optional[float] = None
 
+        # 初始化 RNNoise 服务（独立模块，可选）
+        self.rnnoise_service = None
+        if rnnoise_enabled:
+            try:
+                from wakefusion.services.rnnoise_service import RNNoiseService
+                self.rnnoise_service = RNNoiseService(
+                    enabled=True,
+                    sample_rate=capture_sample_rate
+                )
+                if self.rnnoise_service.is_available():
+                    logger.info("RNNoise service integrated into AudioRouter")
+                else:
+                    logger.warning("RNNoise service requested but not available, using passthrough")
+            except Exception as e:
+                logger.warning(f"Failed to initialize RNNoise service: {e}, using passthrough")
+
         logger.info(
             "AudioRouter initialized",
             extra={
@@ -78,7 +96,8 @@ class AudioRouter:
                 "work_sample_rate": work_sample_rate,
                 "frame_ms": frame_ms,
                 "ring_buffer_sec": ring_buffer_sec,
-                "ring_buffer_capacity": self.ring_buffer_capacity
+                "ring_buffer_capacity": self.ring_buffer_capacity,
+                "rnnoise_enabled": rnnoise_enabled and (self.rnnoise_service is not None and self.rnnoise_service.is_available())
             }
         )
 
@@ -113,10 +132,15 @@ class AudioRouter:
         start_time = time.perf_counter()
 
         try:
-            # 下采样到工作采样率
-            pcm16 = self._resample(raw_frame.pcm16)
+            # 1. RNNoise 降噪（在 48kHz 下处理，如果启用）
+            pcm16_raw = raw_frame.pcm16
+            if self.rnnoise_service is not None and self.rnnoise_service.is_available():
+                pcm16_raw = self.rnnoise_service.process(pcm16_raw)
+            
+            # 2. 下采样到工作采样率
+            pcm16 = self._resample(pcm16_raw)
 
-            # 创建工作音频帧
+            # 3. 创建工作音频帧
             frame = AudioFrame(
                 ts=raw_frame.ts,
                 pcm16=pcm16,

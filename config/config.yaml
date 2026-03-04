@@ -9,6 +9,7 @@ audio:
   ring_buffer_sec: 2.0  # Ring buffer长度（秒）
   pre_roll_ms: 800  # Pre-roll时长（毫秒）
   channels: 1  # 声道数
+  rnnoise_enabled: false  # RNNoise降噪开关（需要安装 pyrnnoise）
 
 # KWS配置
 kws:

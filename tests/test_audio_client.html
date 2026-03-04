@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WakeFusion 音频状态机测试</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #1e1e1e; color: #fff; padding: 30px; }
+        .container { max-width: 500px; margin: 0 auto; background: #2d2d2d; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); text-align: center; }
+        
+        .status-box { padding: 20px; border-radius: 8px; margin: 20px 0; font-size: 1.5em; font-weight: bold; transition: all 0.3s ease; }
+        .idle { background-color: #424242; color: #aaa; }
+        .streaming { background-color: #1b5e20; color: #69f0ae; box-shadow: 0 0 20px rgba(27, 94, 32, 0.8); }
+        
+        .btn-stop { background-color: #d32f2f; color: white; border: none; padding: 15px 30px; font-size: 1.2em; border-radius: 8px; cursor: pointer; display: none; margin: 0 auto; font-weight: bold;}
+        .btn-stop:hover { background-color: #b71c1c; }
+        .btn-stop:active { transform: scale(0.95); }
+        
+        .data-info { margin-top: 15px; font-family: monospace; color: #00e5ff; font-size: 1.1em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🎙️ 智能唤醒与音频网关</h2>
+        <div id="conn-status" style="color: #aaa; margin-bottom: 10px;">🔴 WebSocket 未连接 (ws://127.0.0.1:8001)</div>
+        
+        <div id="status-box" class="status-box idle">
+            💤 潜伏监听中...<br>
+            <span style="font-size: 0.6em; font-weight: normal;">(请对麦克风说："你好小康")</span>
+        </div>
+
+        <button id="btn-stop" class="btn-stop">🛑 大模型已处理完毕 (停止音频)</button>
+        <div id="data-info" class="data-info"></div>
+    </div>
+
+    <script>
+        const ws = new WebSocket("ws://127.0.0.1:8001/ws/audio");
+        const statusBox = document.getElementById('status-box');
+        const btnStop = document.getElementById('btn-stop');
+        const dataInfo = document.getElementById('data-info');
+        const connStatus = document.getElementById('conn-status');
+
+        let bytesReceived = 0;
+
+        ws.onopen = () => {
+            connStatus.innerHTML = "🟢 WebSocket 已连接";
+            connStatus.style.color = "#4caf50";
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            // 将"变绿"的逻辑提取出来
+            const setStreamingUI = (keyword = "未知唤醒词") => {
+                if (statusBox.className.includes("idle")) {
+                    statusBox.className = "status-box streaming";
+                    statusBox.innerHTML = `✨ 唤醒成功！[${keyword}]<br><span style="font-size: 0.6em;">正在源源不断接收音频流...</span>`;
+                    btnStop.style.display = "block";
+                    bytesReceived = 0;
+                }
+            };
+
+            if (data.type === "wake_word_hit") {
+                // 正常收到唤醒口令
+                setStreamingUI(data.keyword);
+            } 
+            else if (data.type === "audio_stream") {
+                // 容错机制：如果直接收到了音频流，说明底层已经唤醒了，立刻补救UI
+                setStreamingUI();
+                
+                // 收到音频流：更新字节计数器
+                bytesReceived += data.data.length;
+                dataInfo.innerHTML = `🌊 已接收音频切片: ${(bytesReceived / 1024).toFixed(2)} KB`;
+            }
+        };
+
+        // 点击停止按钮：调用后端 API
+        btnStop.onclick = () => {
+            fetch("http://127.0.0.1:8001/api/stop")
+                .then(response => response.json())
+                .then(result => {
+                    console.log("拦截成功:", result);
+                    // UI 恢复潜伏状态
+                    statusBox.className = "status-box idle";
+                    statusBox.innerHTML = `💤 潜伏监听中...<br><span style="font-size: 0.6em;">(请对麦克风说："你好小康")</span>`;
+                    btnStop.style.display = "none";
+                    dataInfo.innerHTML = "";
+                })
+                .catch(err => console.error("拦截失败", err));
+        };
+    </script>
+</body>
+</html>

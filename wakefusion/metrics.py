@@ -69,6 +69,16 @@ class MetricsCollector:
         with self._lock:
             self._counters[name] += delta
 
+    def increment_counter(self, name: str, delta: int = 1):
+        """
+        增加计数器（increment的别名，保持API一致性）
+
+        Args:
+            name: 计数器名称
+            delta: 增量（默认1）
+        """
+        self.increment(name, delta)
+
     def set_gauge(self, name: str, value: float):
         """
         设置仪表值（瞬时值）

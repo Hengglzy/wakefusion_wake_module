@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ============================================================================
@@ -91,11 +91,16 @@ class VisionFrame:
     """视觉帧数据"""
     ts: float                          # 时间戳
     rgb: Optional[np.ndarray] = None   # RGB图像 (H,W,3)
-    depth: Optional[np.ndarray] = None # 深度图 (H,W)
+    depth: Optional[np.ndarray] = None # 深度图 (H,W) - 原始16位深度数据，用于距离计算
+    color_depth: Optional[np.ndarray] = None  # 上色后的深度图 (H,W,3) - BGR格式，用于显示
     presence: bool = False             # 是否检测到人
     faces: List[Dict[str, Any]] = field(default_factory=list)  # 检测到的人脸
     distance_m: Optional[float] = None  # 估计距离（米）
     confidence: float = 0.0            # 检测置信度
+    gesture: Optional[str] = None      # 手势类型（thumbs_up, ok, waving, fist）- 向后兼容，优先使用 hands
+    hand_center: Optional[tuple] = None  # 手部中心坐标（归一化，0.0-1.0）- 向后兼容，优先使用 hands
+    hand_distance_m: Optional[float] = None  # 手部距离（米）- 向后兼容，优先使用 hands
+    hands: List[Dict[str, Any]] = field(default_factory=list)  # 多手列表，每个元素包含：index, gesture, x, y, distance_m
 
 
 # ============================================================================
@@ -104,6 +109,8 @@ class VisionFrame:
 
 class BaseEvent(BaseModel):
     """事件基类"""
+    model_config = ConfigDict(extra='allow')  # 允许额外字段（如 payload）
+    
     type: EventType
     ts: float = Field(default_factory=lambda: datetime.now().timestamp())
     session_id: str
@@ -170,6 +177,7 @@ class AudioConfig(BaseModel):
     ring_buffer_sec: float = 2.0       # Ring buffer长度（秒）
     pre_roll_ms: int = 800             # Pre-roll时长（毫秒）
     channels: int = 1                  # 声道数
+    rnnoise_enabled: bool = False      # RNNoise降噪开关
 
 
 class KWSConfig(BaseModel):

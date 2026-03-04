@@ -89,12 +89,13 @@ class WakeFusionRuntime:
                 event_callback=self._on_decision_event
             )
 
-            # 4. 初始化音频路由器
+            # 4. 初始化音频路由器（集成 RNNoise 服务）
             self.audio_router = AudioRouter(
                 capture_sample_rate=self.config.audio.capture_sample_rate,
                 work_sample_rate=self.config.audio.work_sample_rate,
                 frame_ms=self.config.audio.frame_ms,
-                ring_buffer_sec=self.config.audio.ring_buffer_sec
+                ring_buffer_sec=self.config.audio.ring_buffer_sec,
+                rnnoise_enabled=self.config.audio.rnnoise_enabled
             )
 
             # 5. 初始化KWS工作线程

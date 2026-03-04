@@ -2,6 +2,6 @@
 决策模块初始化
 """
 
-from wakefusion.decision.decision_engine import DecisionEngine, FusionState
+from .decision_engine import DecisionEngine, VisionGateResult, FusionState
 
-__all__ = ['DecisionEngine', 'FusionState']
+__all__ = ['DecisionEngine', 'VisionGateResult', 'FusionState']

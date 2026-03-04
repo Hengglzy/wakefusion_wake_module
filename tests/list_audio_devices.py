@@ -99,7 +99,7 @@ def test_device(device_index: int, duration_sec: int = 5):
             if int(elapsed) > int(elapsed - 0.02):
                 energy_bar = min(50, int(rms / 50))
                 bar = "█" * energy_bar + "░" * (50 - energy_bar)
-                print(f"[{int(elapsed)}s] 音频能量: {bar] {rms:.1f}")
+                print(f"[{int(elapsed)}s] 音频能量: {bar} {rms:.1f}")
 
         stream.stop_stream()
         stream.close()

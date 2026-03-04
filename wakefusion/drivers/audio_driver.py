@@ -89,7 +89,8 @@ class XVF3800Driver:
         if not self.pyaudio:
             self.pyaudio = pyaudio.PyAudio()
 
-        logger.info(f"Searching for audio device matching: {self.device_match}")
+        # 设备搜索日志改为 DEBUG，避免在终端反复刷屏
+        logger.debug(f"Searching for audio device matching: {self.device_match}")
 
         # 如果配置为"default"，使用系统默认输入设备
         if self.device_match.lower() == "default":

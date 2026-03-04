@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WakeFusion 视觉 WebSocket 测试</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e1e; color: #fff; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: #2d2d2d; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .status { padding: 10px; border-radius: 5px; font-weight: bold; margin-bottom: 20px; text-align: center; }
+        .connected { background-color: #2e7d32; color: white; }
+        .disconnected { background-color: #c62828; color: white; }
+        .data-box { background: #000; padding: 15px; border-radius: 5px; font-family: monospace; white-space: pre-wrap; height: 350px; overflow-y: auto; color: #00ff00;}
+        .highlight { color: #00e5ff; font-size: 1.2em; font-weight: bold; margin-bottom: 10px;}
+        .empty-target { color: #ff9800; font-size: 1.2em; font-weight: bold; margin-bottom: 10px;}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>👁️ 视觉数据实时监控台</h2>
+        <div id="status" class="status disconnected">🔴 未连接</div>
+        
+        <div id="quick-info" class="empty-target">👀 正在等待连接...</div>
+        
+        <div id="data-container" style="display: none;">
+            <h3>实时 JSON 数据流：</h3>
+            <div id="data-box" class="data-box"></div>
+        </div>
+    </div>
+
+    <script>
+        const ws = new WebSocket("ws://127.0.0.1:8000/ws/vision");
+        const statusDiv = document.getElementById('status');
+        const dataBox = document.getElementById('data-box');
+        const quickInfo = document.getElementById('quick-info');
+        const dataContainer = document.getElementById('data-container');
+
+        // 看门狗定时器
+        let watchdogTimer = null;
+        const TIMEOUT_MS = 1000; // 如果 1000 毫秒没收到数据，就认为人离开了
+
+        // 设置为"无人"状态的函数
+        function setEmptyState() {
+            quickInfo.textContent = "👀 没有目标";
+            quickInfo.className = "empty-target";
+            dataContainer.style.display = "none";
+        }
+
+        ws.onopen = function() {
+            statusDiv.textContent = "🟢 WebSocket 已连接";
+            statusDiv.className = "status connected";
+            setEmptyState();
+        };
+
+        ws.onmessage = function(event) {
+            // 每次收到数据，立刻重置看门狗定时器
+            clearTimeout(watchdogTimer);
+            watchdogTimer = setTimeout(setEmptyState, TIMEOUT_MS);
+
+            // 1. 解析原始 JSON 数据
+            let data = JSON.parse(event.data);
+            let faceList = [];
+            
+            // 2. 灵活提取人脸数组
+            if (Array.isArray(data)) {
+                faceList = data; 
+            } else if (data.faces && Array.isArray(data.faces)) {
+                faceList = data.faces;
+            } else if (data.type === "face_data" || data.confidence) {
+                faceList = [data]; 
+            } else {
+                for (let key in data) {
+                    if (Array.isArray(data[key])) {
+                        faceList = data[key];
+                        break;
+                    }
+                }
+            }
+
+            // 过滤有效的人脸数据
+            faceList = faceList.filter(item => item.distance !== undefined || item.confidence !== undefined);
+
+            // 3. 核心逻辑判断与界面更新
+            if (faceList.length > 0) {
+                let hasPersonWithin4m = false;
+                let within4mCount = 0;
+
+                // 遍历所有人脸，分配 ID 和检查距离
+                faceList.forEach((face, index) => {
+                    face.id = index + 1;
+                    if (face.distance && face.distance <= 4.0) {
+                        hasPersonWithin4m = true;
+                        within4mCount++;
+                    }
+                });
+
+                // 💡 核心逻辑：只有在4m内有人才显示，4m外的人忽略
+                if (hasPersonWithin4m) {
+                    // 显示：🧍 发现 X 人 | 🟢(含4m内)
+                    let infoText = `🧍 发现 ${within4mCount} 人 | 🟢(含4m内)`;
+                    quickInfo.textContent = infoText;
+                    quickInfo.className = "highlight";
+
+                    // 4. 显示带 ID 的 JSON 数据（只包含4m内的人）
+                    let facesWithin4m = faceList.filter(face => face.distance && face.distance <= 4.0);
+                    let finalOutput = {
+                        timestamp: new Date().toLocaleTimeString(),
+                        person_count: facesWithin4m.length,
+                        faces: facesWithin4m
+                    };
+                    
+                    dataBox.textContent = JSON.stringify(finalOutput, null, 2);
+                    dataContainer.style.display = "block";
+                } else {
+                    // 所有人都在4m外，当作无人处理
+                    setEmptyState();
+                }
+
+            } else {
+                // 如果后端发来了空数组 []
+                setEmptyState();
+            }
+        };
+
+        ws.onclose = function() {
+            clearTimeout(watchdogTimer);
+            statusDiv.textContent = "🔴 WebSocket 连接已断开";
+            statusDiv.className = "status disconnected";
+            quickInfo.textContent = "⚠️ 连接断开";
+            dataContainer.style.display = "none";
+        };
+
+        ws.onerror = function(error) {
+            console.error("WebSocket 发生错误:", error);
+        };
+    </script>
+</body>
+</html>
