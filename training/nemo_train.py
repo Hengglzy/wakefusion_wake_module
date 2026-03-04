@@ -10,7 +10,8 @@ WakeFusion 模型训练脚本 V3 (终极稳定版)
 5. ASCII 编码清单，避免 GBK 报错
 
 运行环境：wakefusion 虚拟环境（需要 GPU）
-运行命令：python fast_train.py
+运行命令（从项目根目录）：
+  python training/nemo_train.py
 
 前置条件：
   1. 已运行 training/tts_positive_generator.py 生成 TTS 正样本
@@ -39,6 +40,7 @@ except ImportError:
 
 
 # ================= 配置区 =================
+# 路径基于项目根目录（从根目录运行脚本）
 TRAIN_MANIFEST = os.path.join("custom_dataset", "manifests", "train_manifest.json")
 VAL_MANIFEST = os.path.join("custom_dataset", "manifests", "val_manifest.json")
 OUTPUT_MODEL = "xiaokang_xvf3800_pro.nemo"
@@ -154,7 +156,7 @@ def main():
     )
 
     # 9. 配置 ModelCheckpoint（保存最佳模型权重）
-    ckpt_dir = os.path.join("training_checkpoints", "fast_train")
+    ckpt_dir = os.path.join("training_checkpoints", "nemo_train")
     os.makedirs(ckpt_dir, exist_ok=True)
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,

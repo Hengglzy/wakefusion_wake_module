@@ -7,8 +7,14 @@ XVF3800 唤醒词专属采集与增强工具
   - 负样本原声: real_others_<timestamp>.wav
   - 增强变体:   *_aug_quiet.wav (音量减半), *_aug_noisy.wav (加白噪声)
 
-⚠️ 本脚本的 auto_augment 只处理纯原声录音（real_*），
-   不碰 TTS 文件、切片文件、以及 positive_data_factory 生成的变调变速文件。
+⚠️ 重要修复（防止文件数量爆炸）：
+   - auto_augment_data() 现在只处理本次新录制的文件，不会重复处理已有文件
+   - 如果录制 20 个新文件，只会生成 40 个增强文件（而不是处理所有已有文件）
+
+与其他脚本的协作关系：
+  - 本脚本生成: real_*_aug_*.wav
+  - positive_data_factory.py 会处理 real_* 并生成 *_pitch_* 和 *_speed_*
+  - 本脚本排除: tts_*, slice_*, mega_*, *_pitch_*, *_speed_*（避免冲突）
 
 运行环境：wakefusion 虚拟环境
 运行命令：python training/xvf3800_collector.py
@@ -75,14 +81,14 @@ def record_audio(duration, device=None):
                 channels=1,
                 device=attempt_device
             )
-    sd.wait()
-    print("🟢 录音结束")
+            sd.wait()
+            print("🟢 录音结束")
 
             # 如果是多通道，只取第一个通道
             if audio.ndim > 1 and audio.shape[1] > 1:
                 audio = audio[:, 0]
 
-    return audio.flatten()
+            return audio.flatten()
 
         except Exception as e:
             last_error = e
@@ -105,61 +111,87 @@ def record_audio(duration, device=None):
 
 
 def collect_samples(label_dir, prefix, count):
-    """通用的连续采集与保存函数"""
+    """
+    通用的连续采集与保存函数。
+    返回本次新录制的文件列表（用于后续增强）。
+    """
+    new_files = []
     for i in range(count):
         input(f"👉 准备好后，按回车键开始录制第 {i+1}/{count} 条...")
         audio = record_audio(DURATION, DEVICE_ID)
-        filename = os.path.join(label_dir, f"{prefix}_{int(time.time())}.wav")
-        wavfile.write(filename, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+        filename = f"{prefix}_{int(time.time())}.wav"
+        filepath = os.path.join(label_dir, filename)
+        wavfile.write(filepath, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+        new_files.append(filepath)
+    return new_files
 
 
-def auto_augment_data(target_dirs):
+def auto_augment_data(new_files):
     """
-    自动数据增强：仅对纯原声真人录音(real_前缀)进行混音裂变。
+    自动数据增强：仅对本次新录制的纯原声真人录音进行混音裂变。
+    
+    核心改进：只处理传入的 new_files 列表，而不是扫描整个目录。
+    这样可以避免重复处理已有文件，防止文件数量爆炸。
     
     排除规则（不碰以下文件）：
       - tts_*      → TTS 生成的样本（已有多声音多风格）
       - slice_*    → negative_slicer 切片的环境音
+      - mega_*     → mega_dataset_generator 生成的大规模数据
       - *_aug_*    → 本函数已生成的增强版本
       - *_pitch_*  → positive_data_factory 生成的变调文件
       - *_speed_*  → positive_data_factory 生成的变速文件
     """
+    if not new_files:
+        return 0
+    
     print("\n" + "=" * 40)
     print("🪄 正在进行自动混音与数据裂变...")
+    print(f"   处理范围: 仅本次新录制的 {len(new_files)} 个文件")
     
     augmented_count = 0
-    for category_dir in target_dirs:
-        # 🛠️ 只对纯原声真人录音做增强，排除所有衍生文件
-        files = [
-            f for f in os.listdir(category_dir)
-            if f.endswith('.wav')
-            and f.startswith('real_')
-            and 'aug' not in f
-            and 'pitch' not in f
-            and 'speed' not in f
-        ]
-        for f in files:
-            filepath = os.path.join(category_dir, f)
+    for filepath in new_files:
+        # 验证文件存在且符合命名规则
+        if not os.path.exists(filepath):
+            continue
+        
+        filename = os.path.basename(filepath)
+        
+        # 只处理 real_ 前缀的纯原声文件
+        if not filename.startswith('real_'):
+            continue
+        
+        # 排除已增强的文件
+        if 'aug' in filename or 'pitch' in filename or 'speed' in filename:
+            continue
+        
+        # 检查是否已经生成过增强数据，避免重复增强
+        quiet_path = filepath.replace(".wav", "_aug_quiet.wav")
+        noisy_path = filepath.replace(".wav", "_aug_noisy.wav")
+        
+        if os.path.exists(quiet_path) and os.path.exists(noisy_path):
+            continue  # 已存在，跳过
+        
+        try:
+            audio, _ = librosa.load(filepath, sr=SAMPLE_RATE)
             
-            # 检查是否已经生成过增强数据，避免重复增强
-            quiet_path = filepath.replace(".wav", "_aug_quiet.wav")
-            noisy_path = filepath.replace(".wav", "_aug_noisy.wav")
-            
-            if not os.path.exists(quiet_path) or not os.path.exists(noisy_path):
-                audio, _ = librosa.load(filepath, sr=SAMPLE_RATE)
-                
-                # 1. 音量减小版 (模拟远场)
+            # 1. 音量减小版 (模拟远场)
+            if not os.path.exists(quiet_path):
                 audio_quiet = audio * 0.5
                 wavfile.write(quiet_path, SAMPLE_RATE, (audio_quiet * 32767).astype(np.int16))
-                
-                # 2. 注入设备底噪 (白噪声模拟)
+                augmented_count += 1
+            
+            # 2. 注入设备底噪 (白噪声模拟)
+            if not os.path.exists(noisy_path):
                 noise = np.random.normal(0, 0.005, len(audio))
                 audio_noisy = np.clip(audio + noise, -1.0, 1.0)
                 wavfile.write(noisy_path, SAMPLE_RATE, (audio_noisy * 32767).astype(np.int16))
-                
-                augmented_count += 2
+                augmented_count += 1
+        except Exception as e:
+            print(f"  ⚠️ 处理 {filename} 时出错: {e}")
+            continue
             
     print(f"✅ 数据裂变完成！本次新增了 {augmented_count} 条增强数据。")
+    return augmented_count
 
 
 def main():
@@ -196,10 +228,11 @@ def main():
         
         if choice == '1':
             try:
-            count = int(input("请输入要录制的正样本数量: "))
-            print(f"\n🎯 准备录制 {count} 条唤醒词 '你好小康'...")
-            collect_samples(POS_DIR, "real_xiaokang", count)
-            auto_augment_data([POS_DIR])
+                count = int(input("请输入要录制的正样本数量: "))
+                print(f"\n🎯 准备录制 {count} 条唤醒词 '你好小康'...")
+                new_files = collect_samples(POS_DIR, "real_xiaokang", count)
+                if new_files:
+                    auto_augment_data(new_files)
             except (ValueError, KeyboardInterrupt) as e:
                 if isinstance(e, KeyboardInterrupt):
                     print("\n⚠️ 录制已中断")
@@ -211,10 +244,11 @@ def main():
             
         elif choice == '2':
             try:
-            count = int(input("请输入要录制的负样本数量: "))
-            print(f"\n🛡️ 准备录制 {count} 条负样本 (请专门录制导致误唤醒的废话，如 '小康小康', 'Yes' 等)...")
-            collect_samples(NEG_DIR, "real_others", count)
-            auto_augment_data([NEG_DIR])
+                count = int(input("请输入要录制的负样本数量: "))
+                print(f"\n🛡️ 准备录制 {count} 条负样本 (请专门录制导致误唤醒的废话，如 '小康小康', 'Yes' 等)...")
+                new_files = collect_samples(NEG_DIR, "real_others", count)
+                if new_files:
+                    auto_augment_data(new_files)
             except (ValueError, KeyboardInterrupt) as e:
                 if isinstance(e, KeyboardInterrupt):
                     print("\n⚠️ 录制已中断")
@@ -226,13 +260,16 @@ def main():
             
         elif choice == '3':
             try:
-            pos_count = int(input("请输入正样本数量: "))
-            neg_count = int(input("请输入负样本数量: "))
-            print(f"\n🎯 阶段一：录制 {pos_count} 条唤醒词 '你好小康'...")
-            collect_samples(POS_DIR, "real_xiaokang", pos_count)
-            print(f"\n🛡️ 阶段二：录制 {neg_count} 条负样本...")
-            collect_samples(NEG_DIR, "real_others", neg_count)
-            auto_augment_data([POS_DIR, NEG_DIR])
+                pos_count = int(input("请输入正样本数量: "))
+                neg_count = int(input("请输入负样本数量: "))
+                print(f"\n🎯 阶段一：录制 {pos_count} 条唤醒词 '你好小康'...")
+                pos_new_files = collect_samples(POS_DIR, "real_xiaokang", pos_count)
+                print(f"\n🛡️ 阶段二：录制 {neg_count} 条负样本...")
+                neg_new_files = collect_samples(NEG_DIR, "real_others", neg_count)
+                # 合并所有新文件，一次性增强
+                all_new_files = pos_new_files + neg_new_files
+                if all_new_files:
+                    auto_augment_data(all_new_files)
             except (ValueError, KeyboardInterrupt) as e:
                 if isinstance(e, KeyboardInterrupt):
                     print("\n⚠️ 录制已中断")
