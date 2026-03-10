@@ -1,0 +1,354 @@
+"""
+ASR服务模块 - FunASR流式识别
+接收Core Server的音频数据，进行实时语音识别，通过WebSocket发送识别结果给LLM
+
+通信协议：
+  - ZMQ PULL：接收Core Server的音频数据（tcp://127.0.0.1:{asr_pull_port}）
+  - WebSocket Server：向LLM发送识别文本（ws://0.0.0.0:{asr_ws_port}）
+"""
+import json
+import logging
+import threading
+import time
+import zmq
+import numpy as np
+from typing import Optional, Dict, Any
+from wakefusion.config import get_config
+
+logger = logging.getLogger(__name__)
+
+
+class ASRModule:
+    """ASR模块：FunASR流式识别"""
+    
+    def __init__(self, config):
+        """
+        初始化ASR模块
+        
+        Args:
+            config: 应用配置对象
+        """
+        self.config = config
+        self.asr_config = config.asr
+        self.zmq_config = config.zmq
+        self.websocket_config = config.websocket
+        
+        # FunASR模型和缓存
+        self.model = None
+        self.cache = {}  # 状态缓存，必须在整个一句话期间维护
+        
+        # ZMQ和WebSocket
+        self.zmq_context = None
+        self.pull_socket = None
+        self.ws_server = None
+        self.ws_clients = []  # WebSocket客户端连接列表
+        self.ws_loop = None  # WebSocket线程的event loop引用
+        
+        # 运行状态
+        self._running = False
+        
+        # 加载FunASR模型
+        self._load_model()
+        
+        # 初始化ZMQ和WebSocket
+        self._init_zmq()
+        self._init_websocket()
+    
+    def _load_model(self):
+        """加载FunASR模型（paraformer-zh-online）"""
+        try:
+            logger.info(f"正在加载FunASR模型: {self.asr_config.model_name}...")
+            
+            # 导入FunASR AutoModel
+            try:
+                from funasr import AutoModel
+            except ImportError:
+                logger.error("FunASR未安装，请运行: pip install funasr")
+                raise
+            
+            # 加载模型（paraformer-zh-online支持流式识别）
+            # 如果配置了model_path，使用本地路径；否则使用模型名称自动下载
+            if self.asr_config.model_path and self.asr_config.model_path.strip():
+                model_path = self.asr_config.model_path.strip()
+                logger.info(f"使用本地模型路径: {model_path}")
+                self.model = AutoModel(
+                    model=model_path,
+                    trust_remote_code=True,  # 绕过安全验证
+                    disable_update=True  # 加快启动速度
+                )
+            else:
+                # 使用模型名称，FunASR会自动从ModelScope下载
+                logger.info(f"使用模型名称自动下载: {self.asr_config.model_name}")
+                self.model = AutoModel(
+                    model=self.asr_config.model_name,
+                    trust_remote_code=True,  # 绕过安全验证
+                    disable_update=True  # 加快启动速度
+                )
+            
+            logger.info(f"✅ FunASR模型加载成功: {self.asr_config.model_name}")
+            
+        except ImportError as e:
+            logger.error(f"FunASR导入失败: {e}")
+            logger.error("请确保已安装FunASR: pip install funasr modelscope")
+            raise
+        except Exception as e:
+            logger.error(f"FunASR模型加载失败: {e}")
+            logger.warning("ASR功能将不可用，但模块会继续运行（跳过推理）")
+            self.model = None  # 设置为None，后续会跳过推理
+    
+    def _init_zmq(self):
+        """初始化ZMQ PULL Socket"""
+        self.zmq_context = zmq.Context()
+        self.pull_socket = self.zmq_context.socket(zmq.PULL)
+        self.pull_socket.setsockopt(zmq.RCVHWM, 50)  # 接收端限制积压，宁可丢帧也不能让延迟累积
+        self.pull_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
+        logger.info(f"ZMQ PULL Socket已绑定: tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
+    
+    def _init_websocket(self):
+        """初始化WebSocket服务器"""
+        try:
+            import websockets
+            from websockets.server import serve
+            
+            async def websocket_handler(websocket, path):
+                """WebSocket连接处理"""
+                logger.info(f"新的WebSocket客户端连接: {websocket.remote_address}")
+                self.ws_clients.append(websocket)
+                try:
+                    async for message in websocket:
+                        # 处理客户端消息（如果需要）
+                        pass
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+                finally:
+                    if websocket in self.ws_clients:
+                        self.ws_clients.remove(websocket)
+                    logger.info(f"WebSocket客户端断开: {websocket.remote_address}")
+            
+            # 启动WebSocket服务器（在独立线程中）
+            import asyncio
+            async def run_ws_server():
+                # 保存event loop引用，供其他线程使用
+                self.ws_loop = asyncio.get_event_loop()
+                async with serve(websocket_handler, "0.0.0.0", self.websocket_config.asr_port):
+                    await asyncio.Future()  # 永久运行
+            
+            self.ws_thread = threading.Thread(
+                target=lambda: asyncio.run(run_ws_server()),
+                daemon=True
+            )
+            self.ws_thread.start()
+            logger.info(f"WebSocket服务器已启动: ws://0.0.0.0:{self.websocket_config.asr_port}")
+        except ImportError:
+            logger.warning("websockets未安装，WebSocket功能将不可用")
+            self.ws_clients = []
+    
+    def _send_to_llm(self, text: str, is_final: bool = False, confidence: float = 0.0):
+        """
+        通过WebSocket向LLM发送识别结果
+        
+        Args:
+            text: 识别文本
+            is_final: 是否为最终结果
+            confidence: 置信度
+        """
+        if not self.ws_clients:
+            return
+        
+        message = {
+            "type": "asr_result",
+            "text": text,
+            "is_final": is_final,
+            "confidence": confidence,
+            "timestamp": time.time()
+        }
+        
+        message_json = json.dumps(message, ensure_ascii=False)
+        
+        # 向所有连接的客户端广播（线程安全）
+        import asyncio
+        async def broadcast():
+            disconnected = []
+            for client in list(self.ws_clients):  # 创建副本避免迭代时修改
+                try:
+                    await client.send(message_json)
+                except Exception as e:
+                    logger.warning(f"发送WebSocket消息失败: {e}")
+                    disconnected.append(client)
+            
+            # 清理断开的连接
+            for client in disconnected:
+                if client in self.ws_clients:
+                    self.ws_clients.remove(client)
+        
+        # 使用线程安全的方式调用（从音频处理线程调用WebSocket线程的event loop）
+        if self.ws_loop and self.ws_loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(broadcast(), self.ws_loop)
+            except Exception as e:
+                logger.error(f"WebSocket广播失败: {e}")
+        else:
+            logger.warning("WebSocket event loop 不可用，无法发送消息")
+    
+    def _process_audio_chunk(self, audio_chunk: bytes, is_final: bool = False):
+        """
+        处理音频块，进行FunASR推理
+        
+        Args:
+            audio_chunk: 音频数据（二进制PCM，int16格式）
+            is_final: 是否为最终音频块
+        """
+        if self.model is None:
+            logger.warning("FunASR模型未加载，跳过推理")
+            return
+        
+        try:
+            # 将二进制PCM转换为numpy数组
+            audio_array = np.frombuffer(audio_chunk, dtype=np.int16)
+            
+            # 如果音频块为空且不是最终标记，跳过
+            if len(audio_array) == 0 and not is_final:
+                return
+            
+            # FunASR流式推理（使用cache机制）
+            # paraformer-zh-online支持流式识别，需要维护cache状态
+            if is_final:
+                # FunASR 不接受 None，如果是空数组，喂给它一段微小的静音来安全触发结算
+                if len(audio_array) == 0:
+                    audio_array = np.zeros(160, dtype=np.int16)  # 10ms 静音（16kHz * 0.01s = 160）
+                
+                # 最终结果：设置is_final=True获取完整识别文本
+                res = self.model.generate(
+                    input=audio_array,
+                    cache=self.cache,
+                    is_final=True
+                )
+            else:
+                # 中间结果：实时推理，返回partial_text
+                res = self.model.generate(
+                    input=audio_array,
+                    cache=self.cache,
+                    is_final=False
+                )
+            
+            # 提取识别文本
+            # FunASR返回格式可能是列表、dict或字符串，需要适配
+            if isinstance(res, list) and len(res) > 0:
+                # 列表格式：[{'key': '...', 'text': '...'}] 或 [{'text': '...'}]
+                first_item = res[0]
+                if isinstance(first_item, dict):
+                    text = first_item.get("text", "")
+                    confidence = first_item.get("confidence", 0.95)
+                else:
+                    text = str(first_item)
+                    confidence = 0.95
+            elif isinstance(res, dict):
+                text = res.get("text", "")
+                # 如果有置信度信息，提取
+                confidence = res.get("confidence", 0.0)
+            elif isinstance(res, str):
+                text = res
+                confidence = 0.95  # 默认置信度
+            else:
+                # 其他格式，尝试转换为字符串
+                text = str(res) if res else ""
+                confidence = 0.95
+            
+            # 发送识别结果（如果有文本）
+            if text and text.strip():
+                self._send_to_llm(text.strip(), is_final=is_final, confidence=confidence)
+                if is_final:
+                    logger.info(f"✅ ASR最终识别结果: {text.strip()}")
+                else:
+                    logger.debug(f"📝 ASR中间结果: {text.strip()}")
+            
+            # 如果是最终结果，重置cache
+            if is_final:
+                self.cache = {}
+                logger.info("ASR识别完成，已重置cache")
+        
+        except Exception as e:
+            logger.error(f"FunASR推理失败: {e}")
+            # 如果是最终结果，即使出错也要重置cache
+            if is_final:
+                self.cache = {}
+                logger.warning("ASR推理出错，已重置cache")
+    
+    def process_audio_stream(self):
+        """处理音频流（主循环）"""
+        logger.info("开始处理音频流...")
+        
+        while self._running:
+            try:
+                # 接收音频数据（阻塞）
+                message = self.pull_socket.recv()
+                
+                if message == b"END_OF_SPEECH":
+                    # 收到结束标记，设置is_final=True获取最终结果
+                    logger.info("收到END_OF_SPEECH标记，获取最终识别结果")
+                    self._process_audio_chunk(b"", is_final=True)
+                else:
+                    # 实时在线推理，不累积
+                    self._process_audio_chunk(message, is_final=False)
+            
+            except zmq.Again:
+                continue
+            except Exception as e:
+                logger.error(f"处理音频流时出错: {e}")
+                continue
+    
+    def start(self):
+        """启动ASR模块"""
+        self._running = True
+        
+        # 启动音频处理线程
+        process_thread = threading.Thread(target=self.process_audio_stream, daemon=True)
+        process_thread.start()
+        
+        logger.info("ASR模块已启动")
+    
+    def stop(self):
+        """停止ASR模块"""
+        self._running = False
+        
+        # 关闭ZMQ sockets
+        if self.pull_socket:
+            self.pull_socket.close()
+        if self.zmq_context:
+            self.zmq_context.term()
+        
+        logger.info("ASR模块已停止")
+
+
+def main():
+    """ASR模块主入口"""
+    import logging
+    
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # 加载配置
+    config = get_config()
+    
+    # 创建ASR模块
+    asr_module = ASRModule(config)
+    
+    try:
+        # 启动模块
+        asr_module.start()
+        
+        # 主线程等待
+        while True:
+            time.sleep(1)
+    
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在关闭...")
+    finally:
+        asr_module.stop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,49 +1,49 @@
 """
-音频后台服务 (Audio Service) - 四层防御 + 无缝桥接版
+音频后台服务 (Audio Service) - ZMQ版本
 核心防护：
-1. 静音门限 (VAD)：RMS < 0.003 不推理，避免底噪误判。
+1. 静音门限 (VAD)：使用Silero VAD（深度学习）进行智能语音端点检测，替代传统RMS阈值。
 2. 连续确认机制：连续 2 次推理命中才触发唤醒，过滤噪声尖峰。
-3. 高阈值策略：阈值可按模型调整。
+3. 动态阈值策略：支持运行时动态调整阈值。
 4. 线程安全缓冲区：原地写入环形缓冲区，消除竞态条件。
 5. 零丢失桥接：唤醒时回捞缓冲区音频，确保指令开头不丢失。
 
 支持两种唤醒模型（启动时交互选择）：
   1. NeMo MatchboxNet  (xiaokang_xvf3800_pro.nemo)
   2. OpenWakeWord CNN  (xiaokang_oww.onnx)
+
+通信协议：
+  - ZMQ PUB：发布音频数据流（Multipart Message：JSON元数据 + 二进制PCM）
+  - ZMQ REP：接收控制指令（动态阈值调整）
 """
-import socket
 import json
 import threading
-import base64
 import numpy as np
 import sounddevice as sd
 import torch
 import queue
 import time
+import zmq
 from datetime import datetime
+from wakefusion.config import get_config
+from wakefusion.services.vad_engine import SileroVADEngine
 
 # ================= 配置区 =================
 # --- NeMo MatchboxNet ---
 NEMO_MODEL_PATH = "xiaokang_xvf3800_pro.nemo"
-NEMO_THRESHOLD = 0.75        # NeMo 唤醒阈值
 
 # --- OpenWakeWord CNN ---
 OWW_MODEL_PATH = "xiaokang_oww.onnx"
-OWW_THRESHOLD = 0.75         # OWW 唤醒阈值（提高以减少误唤醒，治标方案）
 
 # --- 公共参数 ---
 SAMPLE_RATE = 16000
 BUFFER_DURATION = 2.0
 STEP_DURATION = 0.2          # 推理步长 0.2 秒，连续确认延迟约 0.4s
 CONSECUTIVE_HITS_REQUIRED = 2  # 连续 2 次命中才唤醒
-VAD_RMS_THRESHOLD = 0.003    # 静音门限：低于此值跳过推理
+VAD_RMS_THRESHOLD = 0.003    # 静音门限：已废弃，由Silero VAD替代（保留用于兼容）
 DEVICE_ID = 14
 COOLDOWN_SECONDS = 2.0
 AUDIO_GAIN = 1.2
 RESCUE_SECONDS = 1.0         # 唤醒时回捞前 N 秒音频，防止指令开头丢失
-
-UDP_DATA_TARGET = ("127.0.0.1", 10002)
-UDP_CTRL_PORT = 10003
 # ==========================================
 
 is_streaming = False
@@ -54,47 +54,157 @@ buffer_len = int(BUFFER_DURATION * SAMPLE_RATE)
 audio_buffer = np.zeros(buffer_len, dtype=np.float32)
 write_pos = 0  # 环形缓冲区写入位置
 
-data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ctrl_sock.bind(("127.0.0.1", UDP_CTRL_PORT))
+# 动态阈值（初始值从配置读取）
+active_threshold = 0.95  # 默认高阈值，将在main()中从配置读取
+
+# VAD引擎（使用组合模式，完全解耦）
+vad_engine = None  # 将在main()中根据配置初始化
+
+# ZMQ Context和Sockets
+zmq_context = None
+zmq_pub_socket = None  # 数据流（PUB）
+zmq_rep_socket = None  # 控制流（REP）
 
 stream_queue = queue.Queue()
 
 
-def control_listener():
-    global is_streaming, cooldown_until, write_pos
-    print(f"🎧 监听控制指令端口: {UDP_CTRL_PORT}")
+def control_listener_zmq():
+    """ZMQ REP控制监听线程：接收动态阈值调整指令"""
+    global active_threshold, cooldown_until, is_streaming, audio_buffer, write_pos
     while True:
         try:
-            data, _ = ctrl_sock.recvfrom(1024)
-            cmd = json.loads(data.decode('utf-8'))
-            if cmd.get("command") == "stop":
-                if is_streaming:
-                    print("\n🛑 收到主控指令：立刻停止推流！进入冷却期...")
-                    is_streaming = False
-                    cooldown_until = time.time() + COOLDOWN_SECONDS
-                    audio_buffer.fill(0.0)
-                    write_pos = 0
+            # 接收REQ请求（带超时）
+            request = zmq_rep_socket.recv_json(zmq.NOBLOCK)
+            command = request.get("command")
+            if command == "set_threshold":
+                new_threshold = float(request.get("value", active_threshold))
+                active_threshold = new_threshold
+                print(f"✅ 阈值已更新: {active_threshold:.2f}")
+                # 快速响应
+                zmq_rep_socket.send_json({"status": "ok", "threshold": active_threshold})
+            elif command == "reset_cooldown":
+                # 重置冷却期，允许立即再次唤醒
+                cooldown_until = 0
+                is_streaming = False  # 确保退出流模式
+                if vad_engine is not None:
+                    vad_engine.reset_states()  # 重置VAD，防止状态残留
+                print("✅ 冷却期已重置，可以立即再次唤醒")
+                zmq_rep_socket.send_json({"status": "ok", "cooldown_reset": True})
+            elif command == "start_streaming":
+                cooldown_until = 0
+                is_streaming = True
+                # 重置缓冲区，防止混入旧声音
+                audio_buffer.fill(0.0)
+                write_pos = 0
+                if vad_engine is not None:
+                    vad_engine.reset_states()  # 重置VAD，防止状态残留
+                print("✅ 收到中枢指令：进入免唤醒持续拾音模式")
+                zmq_rep_socket.send_json({"status": "ok"})
+            else:
+                zmq_rep_socket.send_json({"status": "error", "message": "unknown command"})
+        except zmq.Again:
+            time.sleep(0.01)
+            continue
         except Exception as e:
-            pass
+            try:
+                zmq_rep_socket.send_json({"status": "error", "message": str(e)})
+            except:
+                pass
 
 
 def network_sender():
+    """ZMQ PUB数据发送线程：使用Silero VAD + Multipart Message发送音频数据"""
+    global vad_engine
     while True:
         try:
             chunk = stream_queue.get()
             chunk_int16 = (chunk * 32767).astype(np.int16)
-            payload = {
-                "type": "audio_stream",
-                "data": base64.b64encode(chunk_int16.tobytes()).decode('utf-8')
+            
+            # 使用 Silero VAD 进行智能检测（替代RMS阈值）
+            # 调用VAD引擎接口，完全解耦
+            if vad_engine is not None:
+                vad_active = vad_engine.is_speech(chunk_int16)
+            else:
+                # 降级方案：如果VAD引擎未初始化，使用RMS阈值（向后兼容）
+                rms = np.sqrt(np.mean(chunk**2))
+                vad_active = rms >= VAD_RMS_THRESHOLD
+            
+            # 第一帧：JSON元数据
+            metadata = {
+                "vad": vad_active,
+                "wake_word": {
+                    "detected": False,  # 在唤醒时已发送，这里保持False
+                    "confidence": 0.0
+                },
+                "timestamp": time.time()
             }
-            data_sock.sendto(json.dumps(payload).encode('utf-8'), UDP_DATA_TARGET)
+            
+            # 第二帧：纯二进制PCM数据（int16）
+            # 使用Multipart Message发送
+            zmq_pub_socket.send_multipart([
+                json.dumps(metadata).encode('utf-8'),
+                chunk_int16.tobytes()
+            ], zmq.NOBLOCK)
+        except zmq.Again:
+            # 发送缓冲区满，丢弃此帧
+            pass
         except Exception as e:
             pass
 
 
 def main():
-    global is_streaming, cooldown_until, write_pos
+    global is_streaming, cooldown_until, write_pos, active_threshold
+    global zmq_context, zmq_pub_socket, zmq_rep_socket, vad_engine
+    
+    # 加载配置
+    config = get_config()
+    zmq_config = config.zmq
+    audio_threshold_config = config.audio_threshold
+    conversation_config = config.conversation
+    vad_config = config.vad
+    
+    # 初始化动态阈值（从配置读取）
+    active_threshold = audio_threshold_config.default
+    
+    # 初始化VAD RMS阈值（从配置读取，已废弃，保留用于向后兼容）
+    global VAD_RMS_THRESHOLD
+    VAD_RMS_THRESHOLD = conversation_config.vad_rms_threshold
+    
+    # 初始化Silero VAD引擎（使用组合模式）
+    if vad_config.enabled and vad_config.engine == "silero":
+        try:
+            vad_engine = SileroVADEngine(
+                threshold=vad_config.threshold,
+                sample_rate=vad_config.sample_rate
+            )
+            print(f"✅ Silero VAD引擎已初始化（阈值={vad_config.threshold}，采样率={vad_config.sample_rate}Hz）")
+        except Exception as e:
+            print(f"⚠️ Silero VAD引擎初始化失败: {e}，将使用RMS阈值降级方案")
+            vad_engine = None
+    else:
+        print(f"⚠️ VAD引擎未启用或不是silero，将使用RMS阈值降级方案")
+        vad_engine = None
+    
+    # 初始化ZMQ Context和Sockets
+    zmq_context = zmq.Context()
+    
+    # ZMQ PUB Socket（数据流）
+    zmq_pub_socket = zmq_context.socket(zmq.PUB)
+    audio_pub_port = zmq_config.audio_pub_port
+    zmq_pub_socket.bind(f"tcp://127.0.0.1:{audio_pub_port}")
+    print(f"✅ ZMQ PUB Socket bound to tcp://127.0.0.1:{audio_pub_port}")
+    
+    # ZMQ REP Socket（控制流）
+    zmq_rep_socket = zmq_context.socket(zmq.REP)
+    audio_ctrl_port = zmq_config.audio_ctrl_port
+    zmq_rep_socket.bind(f"tcp://127.0.0.1:{audio_ctrl_port}")
+    zmq_rep_socket.setsockopt(zmq.RCVTIMEO, zmq_config.req_rep_timeout_ms)
+    print(f"✅ ZMQ REP Socket bound to tcp://127.0.0.1:{audio_ctrl_port}")
+    
+    # 启动控制监听线程
+    ctrl_thread = threading.Thread(target=control_listener_zmq, daemon=True)
+    ctrl_thread.start()
+    print(f"✅ 控制监听线程已启动")
 
     # ── 模型选择 ────────────────────────────────────────────────
     print("=" * 55)
@@ -116,8 +226,8 @@ def main():
         oww_session = ort.InferenceSession(OWW_MODEL_PATH)
         oww_input_name = oww_session.get_inputs()[0].name
         oww_features = AudioFeatures(inference_framework="onnx")
-        active_threshold = OWW_THRESHOLD
-        model_tag = f"OpenWakeWord CNN  (阈值 {OWW_THRESHOLD})"
+        # active_threshold 已在第137行从配置读取，这里不需要重新赋值
+        model_tag = f"OpenWakeWord CNN  (阈值 {active_threshold:.2f})"
         print("   ✅ 加载完成")
 
         def infer(audio_float32):
@@ -144,8 +254,8 @@ def main():
         if torch.cuda.is_available():
             nemo_model = nemo_model.cuda()
         nemo_labels = nemo_model.cfg.labels
-        active_threshold = NEMO_THRESHOLD
-        model_tag = f"NeMo MatchboxNet  (阈值 {NEMO_THRESHOLD})"
+        # active_threshold 已在第137行从配置读取，这里不需要重新赋值
+        model_tag = f"NeMo MatchboxNet  (阈值 {active_threshold:.2f})"
         print("   ✅ 加载完成")
 
         def infer(audio_float32):
@@ -165,7 +275,7 @@ def main():
                 return nemo_labels[idx], conf
 
     # ── 线程启动 ────────────────────────────────────────────────
-    threading.Thread(target=control_listener, daemon=True).start()
+    # 注意：control_listener_zmq 已在第156行启动，这里不需要重复启动
     threading.Thread(target=network_sender, daemon=True).start()
 
     # 重置缓冲区
@@ -209,12 +319,18 @@ def main():
     )
 
     print("\n" + "=" * 60)
-    print("🎙️ Audio Service 已启动 (四层防御版)")
+    print("🎙️ Audio Service 已启动 (ZMQ版本)")
     print(f"   模型: {model_tag}")
+    print(f"   初始阈值: {active_threshold:.2f}")
     print(f"   推理步长: 每 {STEP_DURATION}s 一次")
     print(f"   连续确认: 需连续 {CONSECUTIVE_HITS_REQUIRED} 次命中")
-    print(f"   静音门限: RMS < {VAD_RMS_THRESHOLD} 跳过推理")
+    if vad_engine is not None:
+        print(f"   VAD引擎: Silero VAD (阈值={vad_engine.get_threshold()})")
+    else:
+        print(f"   VAD引擎: RMS阈值 (已废弃，< {VAD_RMS_THRESHOLD} 跳过推理)")
     print(f"   音频桥接: 唤醒时回捞前 {RESCUE_SECONDS}s 音频")
+    print(f"   ZMQ PUB: tcp://127.0.0.1:{audio_pub_port}")
+    print(f"   ZMQ REP: tcp://127.0.0.1:{audio_ctrl_port}")
     print("=" * 60)
 
     with stream:
@@ -240,10 +356,23 @@ def main():
                 ])
 
                 # 🌟 第一层：静音门限 (VAD)
-                rms = np.sqrt(np.mean(current_audio**2))
-                if rms < VAD_RMS_THRESHOLD:
-                    consecutive_hits = 0  # 静音时重置连续计数
-                    continue
+                # 使用Silero VAD进行智能检测（如果已初始化）
+                if vad_engine is not None:
+                    # 【修复】只取最后 0.2 秒送给VAD，保证RNN时间线连续，避免喂入重复数据
+                    # 如果传入整个 2.0 秒的缓冲区，会导致重叠数据破坏RNN的时间感知
+                    latest_chunk_samples = int(STEP_DURATION * SAMPLE_RATE)
+                    latest_audio = current_audio[-latest_chunk_samples:]
+                    latest_audio_int16 = (latest_audio * 32767).astype(np.int16)
+                    
+                    if not vad_engine.is_speech(latest_audio_int16):
+                        consecutive_hits = 0  # 静音时重置连续计数
+                        continue
+                else:
+                    # 降级方案：使用RMS阈值（向后兼容）
+                    rms = np.sqrt(np.mean(current_audio**2))
+                    if rms < VAD_RMS_THRESHOLD:
+                        consecutive_hits = 0  # 静音时重置连续计数
+                        continue
 
                 # 🌟 推理（NeMo 或 OWW，由 infer() 闭包统一处理）
                 label, conf = infer(current_audio)
@@ -271,13 +400,22 @@ def main():
                         ])
                         rescue_audio = ordered_audio[-rescue_samples:].copy()
 
-                        # Step 2: 发送唤醒事件（让接收端知道数据流即将到来）
-                        wake_payload = {
-                            "type": "wake_word_hit",
-                            "keyword": "xiaokang",
-                            "confidence": conf
+                        # Step 2: 发送唤醒事件（通过ZMQ PUB，使用Multipart Message）
+                        wake_metadata = {
+                            "vad": True,
+                            "wake_word": {
+                                "detected": True,
+                                "keyword": "xiaokang",
+                                "confidence": float(conf)
+                            },
+                            "timestamp": time.time()
                         }
-                        data_sock.sendto(json.dumps(wake_payload).encode('utf-8'), UDP_DATA_TARGET)
+                        # 发送一个空的音频帧作为唤醒标记（或发送一个特殊标记）
+                        wake_audio = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.int16)
+                        zmq_pub_socket.send_multipart([
+                            json.dumps(wake_metadata).encode('utf-8'),
+                            wake_audio.tobytes()
+                        ], zmq.NOBLOCK)
 
                         # Step 3: 将抢救的音频切片推入队列（必须在 is_streaming=True 之前！）
                         #   切成 0.1 秒小块，模拟麦克风连续吐数据，避免单个超大 UDP 包丢包
@@ -290,6 +428,8 @@ def main():
                                 pass
 
                         # Step 4: 最后才切换流模式（回调线程开始向队列追加实时数据）
+                        if vad_engine is not None:
+                            vad_engine.reset_states()  # 唤醒成功，推流前洗脑，清空杂音记忆
                         is_streaming = True
 
                         print(f"   🌊 已将前 {RESCUE_SECONDS}s 指令音频无缝桥接入推流队列！")
@@ -307,6 +447,17 @@ def main():
 
         except KeyboardInterrupt:
             print("\n🛑 服务已关闭。")
+        finally:
+            # 关闭ZMQ sockets
+            try:
+                if zmq_pub_socket:
+                    zmq_pub_socket.close()
+                if zmq_rep_socket:
+                    zmq_rep_socket.close()
+                if zmq_context:
+                    zmq_context.term()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

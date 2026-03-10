@@ -36,11 +36,15 @@ class ConfigManager:
             self.config_path = config_path
 
         if self.config_path and Path(self.config_path).exists():
+            # 加载YAML文件
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                config_dict = yaml.safe_load(f)
-            self._config = AppConfig(**config_dict)
+                config_dict = yaml.safe_load(f) or {}
+            
+            # 使用 Pydantic 的 model_validate 方法，确保 YAML 中的值能够深度覆盖默认值
+            # 如果 YAML 中缺失某个字段，会使用 types.py 中的默认值
+            self._config = AppConfig.model_validate(config_dict)
         else:
-            # 使用默认配置
+            # 使用默认配置（完全使用 types.py 中的默认值）
             self._config = AppConfig()
 
         return self._config
@@ -83,6 +87,42 @@ class ConfigManager:
     def update_vision_distance(self, distance_m_max: float):
         """更新视觉最大检测距离"""
         self._config.vision.distance_m_max = distance_m_max
+
+    def get_zmq_config(self):
+        """获取ZMQ配置"""
+        return self.config.zmq
+
+    def get_vision_wake_config(self):
+        """获取视觉唤醒配置"""
+        return self.config.vision_wake
+
+    def get_audio_threshold_config(self):
+        """获取音频阈值配置"""
+        return self.config.audio_threshold
+
+    def get_conversation_config(self):
+        """获取持续对话配置"""
+        return self.config.conversation
+
+    def get_environments_config(self):
+        """获取环境配置"""
+        return self.config.environments
+    
+    def get_asr_config(self):
+        """获取ASR配置"""
+        return self.config.asr
+    
+    def get_tts_config(self):
+        """获取TTS配置"""
+        return self.config.tts
+    
+    def get_websocket_config(self):
+        """获取WebSocket配置"""
+        return self.config.websocket
+    
+    def get_vad_config(self):
+        """获取VAD配置"""
+        return self.config.vad
 
 
 # 全局配置实例

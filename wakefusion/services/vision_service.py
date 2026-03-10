@@ -23,6 +23,8 @@ import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from collections import deque
+import zmq
+from wakefusion.config import get_config
 
 # 日志级别设置（MediaPipe 设为 WARNING）
 logging.getLogger("mediapipe").setLevel(logging.WARNING)
@@ -59,28 +61,23 @@ class VisionService:
     
     def __init__(
         self,
-        udp_host: str = "127.0.0.1",
-        udp_port: int = 9999,
-        udp_image_port: int = 10000,
-        udp_depth_port: int = 10001,
-        target_fps: int = 30,
+        config_path: Optional[str] = None,
+        target_fps: int = 15,
         jpeg_quality: int = 55,  # 默认55，在画质和性能之间取得平衡（降低约8%文件大小，画质几乎无影响）
     ):
         """
         初始化视觉服务
         
         Args:
-            udp_host: UDP 目标地址
-            udp_port: UDP 目标端口
-            udp_image_port: UDP 图像端口（JPEG）
-            udp_depth_port: UDP 深度彩色图端口（JPEG，上色后的 BGR 深度图）
+            config_path: 配置文件路径（可选）
             target_fps: 目标帧率
             jpeg_quality: JPEG 压缩质量（0-100）
         """
-        self.udp_host = udp_host
-        self.udp_port = udp_port
-        self.udp_image_port = udp_image_port
-        self.udp_depth_port = udp_depth_port
+        # 加载配置
+        self.config = get_config(config_path)
+        self.vision_wake_config = self.config.vision_wake
+        self.zmq_config = self.config.zmq
+        
         self.target_fps = target_fps
         self.frame_time = 1.0 / target_fps
         self.jpeg_quality = int(jpeg_quality)
@@ -89,11 +86,22 @@ class VisionService:
         self._process_frame_counter = 0  # MediaPipe处理跳帧计数器
         self._depth_send_counter = 0      # 深度图发送跳帧计数器
         
-        # 初始化 UDP 套接字
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 初始化 ZMQ Context 和 PUB Socket
+        self.zmq_context = zmq.Context()
+        self._zmq_pub_socket = self.zmq_context.socket(zmq.PUB)
+        vision_pub_port = self.zmq_config.vision_pub_port
+        self._zmq_pub_socket.bind(f"tcp://127.0.0.1:{vision_pub_port}")
+        vision_logger.info(f"ZMQ PUB Socket bound to tcp://127.0.0.1:{vision_pub_port}")
+        
+        # 视觉唤醒状态机
+        self._visual_wake_state: bool = False
+        self._leave_frame_count: int = 0
+        
+        # 保留图像发送功能（UDP图像端口可保留，或后续讨论）
+        self.udp_image_port = 10000
+        self.udp_depth_port = 10001
         self.udp_image_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_depth_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # 图像发包：避免阻塞（sendto 一般不阻塞，但这里仍尽量轻量）
         self.udp_image_socket.setblocking(False)
         self.udp_depth_socket.setblocking(False)
 
@@ -184,9 +192,9 @@ class VisionService:
         # 最近一帧的人脸检测结果（用于跳帧时复用）
         self._last_faces: List[Dict[str, Any]] = []
         
-        print(
-            f"VisionService initialized: JSON UDP {udp_host}:{udp_port}, "
-            f"IMG UDP {udp_host}:{udp_image_port}, DEPTH UDP {udp_host}:{udp_depth_port}, "
+        vision_logger.info(
+            f"VisionService initialized: ZMQ PUB tcp://127.0.0.1:{vision_pub_port}, "
+            f"IMG UDP 127.0.0.1:{self.udp_image_port}, DEPTH UDP 127.0.0.1:{self.udp_depth_port}, "
             f"FPS={target_fps}, JPEG={self.jpeg_quality}, Max Hands=4"
         )
 
@@ -802,21 +810,78 @@ class VisionService:
         result = self._build_result_from_tracks(faces)
         return result
     
+    def _update_visual_wake_state(self, faces: List[Dict[str, Any]]):
+        """
+        更新视觉唤醒状态机
+        
+        逻辑：
+        1. 如果未唤醒：检查是否有在3米内且正面率>=75%的人脸，满足则唤醒
+        2. 如果已唤醒：检查所有人是否在[0.1m, 3.5m]区间内，连续N帧不在则取消唤醒
+        """
+        detection_distance = self.vision_wake_config.detection_distance_m
+        frontal_threshold = self.vision_wake_config.frontal_percent_threshold
+        distance_range = self.vision_wake_config.distance_range
+        leave_check_frames = self.vision_wake_config.leave_check_frames
+        
+        if not self._visual_wake_state:
+            # 未唤醒状态：检查是否满足唤醒条件
+            for face in faces:
+                distance = face.get("distance")
+                frontal_percent = face.get("frontal_percent", 0.0)
+                
+                if (distance is not None and 
+                    distance <= detection_distance and 
+                    frontal_percent >= frontal_threshold):
+                    # 满足唤醒条件
+                    self._visual_wake_state = True
+                    self._leave_frame_count = 0
+                    vision_logger.info(
+                        f"视觉唤醒：检测到人脸（距离={distance:.2f}m, "
+                        f"正面率={frontal_percent:.1f}%）"
+                    )
+                    break
+        else:
+            # 已唤醒状态：检查所有人是否在有效距离区间内
+            all_in_range = False
+            for face in faces:
+                distance = face.get("distance")
+                if distance is not None:
+                    min_dist, max_dist = distance_range[0], distance_range[1]
+                    if min_dist <= distance <= max_dist:
+                        all_in_range = True
+                        break
+            
+            if all_in_range:
+                # 有人在有效区间内，重置离开计数
+                self._leave_frame_count = 0
+            else:
+                # 所有人都不在有效区间内，增加离开计数
+                self._leave_frame_count += 1
+                if self._leave_frame_count >= leave_check_frames:
+                    # 连续N帧都不在区间内，取消唤醒
+                    self._visual_wake_state = False
+                    self._leave_frame_count = 0
+                    vision_logger.info("视觉唤醒结束：所有人脸离开有效距离区间")
+    
     def send_result(self, result: Dict[str, Any]):
         """
-        通过 UDP 发送检测结果
+        通过 ZMQ PUB 发送检测结果（包含视觉唤醒状态）
         
         Args:
             result: 检测结果字典
         """
         try:
-            json_data = json.dumps(result, ensure_ascii=False)
-            self.udp_socket.sendto(
-                json_data.encode('utf-8'),
-                (self.udp_host, self.udp_port)
-            )
+            # 添加wake字段和timestamp
+            zmq_data = {
+                "wake": self._visual_wake_state,
+                "faces": result.get("faces", []),
+                "hands": result.get("hands", []),
+                "timestamp": time.time()
+            }
+            # 通过ZMQ PUB发送
+            self._zmq_pub_socket.send_json(zmq_data)
         except Exception as e:
-            print(f"Error sending UDP data: {e}")
+            vision_logger.error(f"Error sending ZMQ data: {e}")
 
     def send_frame_image_async(self, bgr_frame: np.ndarray):
         """
@@ -1020,7 +1085,10 @@ class VisionService:
 
                 result["distance_m"] = float(global_distance_m) if global_distance_m is not None else None
                 
-                # 发送结果
+                # 视觉唤醒状态机逻辑
+                self._update_visual_wake_state(faces)
+                
+                # 发送结果（通过ZMQ PUB，包含wake字段）
                 self.send_result(result)
                 
                 # 发送 RGB 图像（JPEG，异步）- 每帧都发送以保持流畅
@@ -1048,7 +1116,12 @@ class VisionService:
             except Exception:
                 pass
             cv2.destroyAllWindows()
-            self.udp_socket.close()
+            # 关闭ZMQ socket
+            try:
+                self._zmq_pub_socket.close()
+                self.zmq_context.term()
+            except Exception:
+                pass
             try:
                 self._img_thread_stop.set()
                 # 给线程一点时间退出（不 join 也可，daemon=True）
@@ -1086,12 +1159,8 @@ def main():
     args = parser.parse_args()
     
     service = VisionService(
-        udp_host=args.host,
-        udp_port=args.port,
-        udp_image_port=args.img_port,
-        udp_depth_port=args.depth_port,
-        target_fps=args.fps
-        ,jpeg_quality=args.jpeg_quality
+        target_fps=args.fps,
+        jpeg_quality=args.jpeg_quality
     )
     
     service.run(camera_index=args.camera)

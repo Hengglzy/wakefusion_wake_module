@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WakeFusion TTS WebSocket 测试</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background-color: #1e1e1e; 
+            color: #fff; 
+            padding: 20px; 
+        }
+        .container { 
+            max-width: 900px; 
+            margin: 0 auto; 
+            background: #2d2d2d; 
+            padding: 20px; 
+            border-radius: 10px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+        }
+        .status { 
+            padding: 10px; 
+            border-radius: 5px; 
+            font-weight: bold; 
+            margin-bottom: 20px; 
+            text-align: center; 
+        }
+        .connected { background-color: #2e7d32; color: white; }
+        .disconnected { background-color: #c62828; color: white; }
+        .info-box {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border-left: 4px solid #ff9800;
+        }
+        .input-section {
+            margin-bottom: 20px;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #aaa;
+            font-size: 0.9em;
+        }
+        textarea {
+            width: 100%;
+            min-height: 100px;
+            padding: 10px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 5px;
+            color: #fff;
+            font-family: monospace;
+            font-size: 14px;
+            resize: vertical;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            font-size: 1em;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        .btn-send {
+            background-color: #4caf50;
+            color: white;
+        }
+        .btn-send:hover {
+            background-color: #45a049;
+        }
+        .btn-stop {
+            background-color: #f44336;
+            color: white;
+        }
+        .btn-stop:hover {
+            background-color: #da190b;
+        }
+        .btn-clear {
+            background-color: #2196F3;
+            color: white;
+        }
+        .btn-clear:hover {
+            background-color: #0b7dda;
+        }
+        button:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        .log-box {
+            background: #000;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 15px;
+            font-size: 0.9em;
+        }
+        .log-item {
+            margin-bottom: 5px;
+            padding: 5px;
+            border-left: 3px solid #4caf50;
+            padding-left: 10px;
+        }
+        .log-item.error {
+            border-left-color: #f44336;
+            color: #ff6b6b;
+        }
+        .log-item.warning {
+            border-left-color: #ff9800;
+            color: #ffb74d;
+        }
+        .highlight {
+            color: #00e5ff;
+            font-weight: bold;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔊 TTS 语音合成测试</h2>
+        
+        <div id="status" class="status disconnected">🔴 未连接 (ws://127.0.0.1:8767)</div>
+        
+        <div class="info-box">
+            <div class="highlight">📡 WebSocket 地址: ws://127.0.0.1:8767</div>
+            <div style="margin-top: 10px; font-size: 0.9em; color: #aaa;">
+                提示：请确保 TTS 模块已启动<br>
+                <code>python -m wakefusion.services.tts_service</code>
+            </div>
+        </div>
+        
+        <div class="input-section">
+            <div class="input-group">
+                <label for="text-input">📝 输入要合成的文本：</label>
+                <textarea id="text-input" placeholder="请输入要合成的文本，例如：你好，我是小康，今天天气很好。"></textarea>
+            </div>
+            
+            <div class="checkbox-group">
+                <input type="checkbox" id="streaming-mode" checked>
+                <label for="streaming-mode" style="display: inline; margin: 0;">流式发送模式（按标点切分发送）</label>
+            </div>
+            
+            <div class="button-group">
+                <button id="btn-send" class="btn-send" onclick="sendText()">📤 发送文本</button>
+                <button id="btn-stop" class="btn-stop" onclick="sendStop()" disabled>🛑 停止合成</button>
+                <button id="btn-clear" class="btn-clear" onclick="clearLog()">🗑️ 清空日志</button>
+            </div>
+        </div>
+        
+        <div>
+            <h3>📋 发送日志：</h3>
+            <div id="log-box" class="log-box"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        const statusDiv = document.getElementById('status');
+        const textInput = document.getElementById('text-input');
+        const logBox = document.getElementById('log-box');
+        const btnSend = document.getElementById('btn-send');
+        const btnStop = document.getElementById('btn-stop');
+        const streamingMode = document.getElementById('streaming-mode');
+        
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                return; // 已连接
+            }
+            
+            ws = new WebSocket("ws://127.0.0.1:8767");
+            
+            ws.onopen = function() {
+                statusDiv.textContent = "🟢 WebSocket 已连接 (ws://127.0.0.1:8767)";
+                statusDiv.className = "status connected";
+                btnSend.disabled = false;
+                btnStop.disabled = false;
+                addLog("✅ WebSocket 连接成功", "success");
+            };
+            
+            ws.onclose = function() {
+                statusDiv.textContent = "🔴 WebSocket 连接已断开";
+                statusDiv.className = "status disconnected";
+                btnSend.disabled = true;
+                btnStop.disabled = true;
+                addLog("🔴 WebSocket 连接已断开", "error");
+            };
+            
+            ws.onerror = function(error) {
+                statusDiv.textContent = "❌ WebSocket 连接错误";
+                statusDiv.className = "status disconnected";
+                addLog("❌ WebSocket 连接错误: " + error, "error");
+            };
+            
+            ws.onmessage = function(event) {
+                // TTS模块通常不返回消息，但如果有响应可以在这里处理
+                try {
+                    const data = JSON.parse(event.data);
+                    addLog("📥 收到响应: " + JSON.stringify(data, null, 2), "success");
+                } catch (e) {
+                    addLog("📥 收到消息: " + event.data, "success");
+                }
+            };
+        }
+        
+        function addLog(message, type = "success") {
+            const logItem = document.createElement('div');
+            logItem.className = `log-item ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            logItem.textContent = `[${timestamp}] ${message}`;
+            logBox.insertBefore(logItem, logBox.firstChild);
+            
+            // 限制显示最近100条日志
+            while (logBox.children.length > 100) {
+                logBox.removeChild(logBox.lastChild);
+            }
+        }
+        
+        function sendText() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog("⚠️ 请先连接 WebSocket", "warning");
+                connect();
+                return;
+            }
+            
+            const text = textInput.value.trim();
+            if (!text) {
+                addLog("⚠️ 请输入要合成的文本", "warning");
+                return;
+            }
+            
+            if (streamingMode.checked) {
+                // 流式发送模式：按标点切分
+                const punctuationPattern = /[。！？.!?，,]/;
+                let remainingText = text;
+                let chunkIndex = 0;
+                
+                function sendNextChunk() {
+                    if (!remainingText) {
+                        addLog("✅ 所有文本块已发送完成", "success");
+                        return;
+                    }
+                    
+                    const match = punctuationPattern.exec(remainingText);
+                    if (match) {
+                        const chunk = remainingText.substring(0, match.index + 1);
+                        remainingText = remainingText.substring(match.index + 1).trim();
+                        
+                        const message = {
+                            type: "tts_request",
+                            text: chunk,
+                            is_final: remainingText.length === 0
+                        };
+                        
+                        ws.send(JSON.stringify(message));
+                        chunkIndex++;
+                        addLog(`📤 发送文本块 ${chunkIndex}: "${chunk}" (final=${message.is_final})`, "success");
+                        
+                        // 继续发送下一块
+                        setTimeout(sendNextChunk, 200); // 模拟流式延迟
+                    } else {
+                        // 没有标点了，发送剩余文本
+                        if (remainingText.length > 0) {
+                            const message = {
+                                type: "tts_request",
+                                text: remainingText,
+                                is_final: true
+                            };
+                            ws.send(JSON.stringify(message));
+                            chunkIndex++;
+                            addLog(`📤 发送文本块 ${chunkIndex}: "${remainingText}" (final=true)`, "success");
+                        }
+                        addLog("✅ 所有文本块已发送完成", "success");
+                    }
+                }
+                
+                sendNextChunk();
+            } else {
+                // 一次性发送
+                const message = {
+                    type: "tts_request",
+                    text: text,
+                    is_final: true
+                };
+                
+                ws.send(JSON.stringify(message, ensure_ascii=False));
+                addLog(`📤 发送完整文本: "${text}"`, "success");
+            }
+        }
+        
+        function sendStop() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog("⚠️ WebSocket 未连接", "warning");
+                return;
+            }
+            
+            const message = {
+                type: "stop_synthesis"
+            };
+            
+            ws.send(JSON.stringify(message));
+            addLog("🛑 发送停止合成信号", "warning");
+        }
+        
+        function clearLog() {
+            logBox.innerHTML = "";
+            addLog("🗑️ 日志已清空", "success");
+        }
+        
+        // 页面加载时自动连接
+        window.onload = function() {
+            connect();
+        };
+    </script>
+</body>
+</html>

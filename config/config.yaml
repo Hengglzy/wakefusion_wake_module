@@ -22,12 +22,19 @@ kws:
   threshold: 0.5  # 检测阈值
   cooldown_ms: 1200  # 冷却时长（毫秒）
 
-# VAD配置
+# VAD配置（更新为Silero VAD）
 vad:
   enabled: true
-  model: "webrtcvad"
-  speech_start_ms: 120  # 语音起始阈值（毫秒）
-  speech_end_ms: 500  # 语音结束阈值（毫秒）
+  engine: "silero"  # VAD引擎：从 "webrtcvad" 改为 "silero"
+  model_version: "v4"  # Silero VAD版本
+  model_name: "silero_vad"  # 模型名称（16kHz）
+  device: "cpu"  # 强制CPU推理，避免占用GPU资源
+  threshold: 0.5  # 语音概率阈值（0.0-1.0），默认0.5
+  sample_rate: 16000  # 采样率
+  # 以下字段保留用于向后兼容（已废弃）
+  model: "webrtcvad"  # 已废弃，由engine替代
+  speech_start_ms: 120  # 语音起始阈值（毫秒）- 已废弃
+  speech_end_ms: 500  # 语音结束阈值（毫秒）- 已废弃
 
 # 视觉配置（Phase 2已启用）
 vision:
@@ -50,3 +57,87 @@ runtime:
   log_level: "INFO"
   websocket_port: 8765  # WebSocket端口
   health_port: 8080  # 健康检查端口
+
+# ZMQ 通信配置
+zmq:
+  # 数据流（PUB-SUB，允许丢帧）
+  vision_pub_port: 5555
+  audio_pub_port: 5556
+  
+  # 控制流（REQ-REP，必须可靠）
+  audio_ctrl_port: 5557
+  req_rep_timeout_ms: 2000  # REQ-REP 超时时间（毫秒）
+  
+  # ASR/TTS模块端口
+  asr_pull_port: 5558  # ASR模块PULL端口（Core Server PUSH到此端口）
+  tts_push_port: 5559  # TTS模块PUSH端口（Core Server PULL从此端口接收）
+  tts_stop_pub_port: 5560  # TTS停止信号PUB端口（Core Server发布，TTS订阅）
+  core_control_rep_port: 5561  # Core Server控制端口（REP，接收LLM指令）
+
+# 视觉唤醒配置
+vision_wake:
+  detection_distance_m: 3.0  # 3米内开始检测
+  frontal_percent_threshold: 75  # 正面率阈值（%）
+  distance_range: [0.1, 3.5]  # 有效距离区间（米）
+  leave_timeout_sec: 1.5  # 离开区间持续多久才判定结束（秒）
+  leave_check_frames: 20  # 连续N帧不在区间内才判定离开（约1.5秒@15fps）
+  visual_cutoff_enabled: true  # 启用视觉斩断机制（最高优先级打断）
+
+# 音频动态阈值配置
+audio_threshold:
+  default: 0.95  # 默认高阈值（无人时）
+  visual_wake: 0.4  # 视觉唤醒后的低阈值
+  change_timeout_ms: 100  # 阈值修改指令超时（毫秒）
+
+# 持续对话配置
+conversation:
+  vad_silence_timeout_default_sec: 8.0  # 默认免唤醒窗口（秒）
+  vad_silence_timeout_extended_sec: 15.0  # 未来用于疑问句延长的窗口（秒）
+  vad_check_interval_ms: 200  # VAD检查间隔（毫秒）
+  vad_rms_threshold: 0.003  # VAD RMS阈值（已废弃，由Silero VAD替代）
+    # 注意：这是简单的RMS能量阈值，已废弃
+    # 如果Silero VAD未启用，将使用此值作为降级方案
+    # 如果环境噪音较大，可以适当提高此值（如0.005-0.01）
+    # 如果环境很安静，可以降低此值（如0.001-0.002）
+
+# ASR配置
+asr:
+  enabled: true
+  engine: "funasr"  # ASR引擎
+  model_name: "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型名称（在线推理模型，完整repo ID）
+  model_path: "D:/AI_Cache/modelscope/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型路径（本地路径，避免联网下载）
+  sample_rate: 16000  # 采样率
+  chunk_size_ms: 100  # 流式识别块大小（毫秒）
+  enable_online_inference: true  # 启用在线推理（真正的流式识别）
+  enable_partial_results: true  # 启用中间结果推送（partial_text）
+  use_cache: true  # 启用cache机制（必须启用，否则流式识别会崩溃）
+  timeout_sec: 30  # 超时时间（秒）
+
+# TTS配置（更新为Qwen3-TTS）
+tts:
+  enabled: true
+  engine: "qwen3-tts"  # TTS引擎：从 "cosyvoice" 改为 "qwen3-tts"
+  model_name: "Qwen3-TTS-12Hz-0.6B-Base"
+  ref_audio_path: "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需，几秒钟即可）
+  sample_rate: 24000  # 采样率（Qwen3-TTS输出为24000Hz）
+  speed: 1.0  # 默认语速
+  chunk_size_ms: 20  # 音频块大小（毫秒）
+  enable_streaming: true  # 是否启用流式输出
+  punctuation_pattern: "[。！？.!?，,]"  # 标点切分正则表达式
+  min_sentence_length: 3  # 最小句子长度（字符数），避免过短片段
+  warmup_text: "系统初始化"  # 冷启动预热文本
+  warmup_enabled: true  # 是否启用冷启动预热
+
+# WebSocket配置（扩展）
+websocket:
+  asr_port: 8766  # ASR WebSocket端口（ASR模块向LLM发送识别结果）
+  tts_port: 8767  # TTS WebSocket端口（TTS模块接收LLM的文本消息）
+  core_control_port: 8768  # Core Server控制WebSocket端口（可选，如果使用WS方案）
+
+# 环境配置（用于启动脚本）
+environments:
+  vision: "wakefusion_vision"
+  audio: "wakefusion"
+  core: "wakefusion"
+  asr: "wakefusion"  # ASR模块Conda环境名（可与core相同）
+  tts: "wakefusion"  # TTS模块Conda环境名（可与core相同）

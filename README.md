@@ -58,12 +58,51 @@ python -m wakefusion.runtime
 
 ### 4. 测试
 
-**健康检查**:
+**快速测试**:
+```bash
+# 运行快速测试工具
+python scripts/quick_test.py
+```
+
+**详细测试手册**:
+请参考 [测试手册](docs/TESTING_MANUAL.md) 了解完整的测试流程。
+
+**模块独立测试**:
+```bash
+# 视觉模块测试
+python wakefusion/tests/test_vision_sub.py
+
+# 音频数据流测试
+python wakefusion/tests/test_audio_sub.py
+
+# 音频控制测试
+python wakefusion/tests/test_audio_ctrl.py
+```
+
+**端到端集成测试**:
+```bash
+# 需要4个终端窗口，分别运行：
+# 终端1: 视觉模块
+conda activate wakefusion_vision
+python -m wakefusion.services.vision_service --fps 15
+
+# 终端2: 音频模块
+conda activate wakefusion
+python -m wakefusion.services.audio_service
+
+# 终端3: Mock ASR
+python wakefusion/tests/mock_asr_saver.py
+
+# 终端4: Core Server
+python -m wakefusion.services.core_server
+```
+
+**健康检查** (旧版):
 ```bash
 curl http://localhost:8080/health
 ```
 
-**WebSocket连接**:
+**WebSocket连接** (旧版):
 ```bash
 wscat -c ws://localhost:8765
 ```
@@ -124,6 +163,7 @@ wakefusion/
 ├── logging.py         # 日志系统
 ├── metrics.py         # 指标收集
 ├── runtime.py         # 主运行时
+├── core_server.py     # 核心决策模块 (ZMQ版本)
 ├── drivers/           # 硬件驱动
 │   ├── audio_driver.py    # XVF3800音频驱动
 │   └── camera_driver.py   # Femto Bolt相机驱动
@@ -134,11 +174,21 @@ wakefusion/
 │   ├── kws_worker.py      # KWS检测
 │   ├── vad_worker.py      # VAD检测
 │   └── face_gate.py       # 视觉门控
+├── services/          # 服务模块
+│   ├── audio_service.py   # 音频服务 (ZMQ版本)
+│   └── vision_service.py  # 视觉服务 (ZMQ版本)
 ├── decision/          # 决策引擎
 │   └── decision_engine.py # 多模态融合决策
-└── io/                # 外部接口
-    ├── publisher_ws.py
-    └── health_server.py
+├── tests/             # 测试脚本
+│   ├── test_vision_sub.py  # 视觉模块测试
+│   ├── test_audio_sub.py   # 音频数据流测试
+│   ├── test_audio_ctrl.py  # 音频控制测试
+│   └── mock_asr_saver.py   # Mock ASR服务
+├── io/                # 外部接口
+│   ├── publisher_ws.py
+│   └── health_server.py
+└── docs/              # 文档
+    └── TESTING_MANUAL.md   # 测试手册
 ```
 
 ## 开发计划
@@ -147,8 +197,14 @@ wakefusion/
 - [ ] Phase 1.2: 性能测试与优化
 - [x] Phase 2.1: Femto Bolt 视觉集成
 - [x] Phase 2.2: 多模态融合决策
-- [ ] Phase 3: 回放测试与参数调优
-- [ ] Phase 4: 生产环境部署
+- [x] Phase 2.3: ZMQ架构重构（前四步）
+  - [x] 统一配置文件
+  - [x] 视觉模块ZMQ改造
+  - [x] 音频模块ZMQ改造
+  - [x] 核心决策模块创建
+- [ ] Phase 3: ASR和TTS模块集成
+- [ ] Phase 4: 回放测试与参数调优
+- [ ] Phase 5: 生产环境部署
 
 ## 故障排查
 

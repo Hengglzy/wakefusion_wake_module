@@ -3,6 +3,7 @@
 # 音频处理
 pyaudio>=0.2.13
 numpy>=1.24.0
+sounddevice>=0.4.6              # 音频播放（用于TTS播放测试）
 
 # KWS (Keyword Spotting)
 openwakeword>=0.6.0          # 备选方案1（需要训练）
@@ -11,13 +12,14 @@ pvporcupine>=1.9.0           # 备选方案3：商业方案（需要Access Key�
 
 # MatchboxNet (NeMo) - 主要方案
 nemo-toolkit[asr]>=1.14.0    # NVIDIA NeMo 框架（包含 MatchboxNet）
-torch>=2.0.0                 # PyTorch（NeMo 依赖）
+torch>=2.0.0                 # PyTorch（NeMo依赖 + Silero VAD依赖）
 torchaudio>=2.0.0            # PyTorch Audio
 librosa>=0.10.0              # 音频特征提取
 soundfile>=0.12.0            # 音频文件读写
 
 # VAD (Voice Activity Detection)
-webrtcvad>=2.0.10
+webrtcvad>=2.0.10            # WebRTC VAD（已废弃，由Silero VAD替代）
+# Silero VAD通过torch.hub.load()自动下载，无需额外安装
 
 # 视觉处理（Phase 2）
 pyorbbecsdk>=0.1.0  # Femto Bolt SDK
@@ -32,11 +34,20 @@ websockets>=11.0
 # 配置管理
 pyyaml>=6.0
 
+# ZMQ通信
+pyzmq>=25.0.0
+
 # 系统监控
 psutil>=5.9.0
 
 # 日志
 colorlog>=6.7.0
+
+# TTS (Text-to-Speech)
+qwen-tts>=1.0.0              # Qwen3-TTS-12Hz-0.6B-Base官方包（支持Voice Clone和流式生成）
+
+# ASR (Automatic Speech Recognition)
+# FunASR依赖将在实现ASR模块时添加
 
 # 训练模块依赖（自动化训练）
 edge-tts>=6.1.0              # TTS生成（免费）

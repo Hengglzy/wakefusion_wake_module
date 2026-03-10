@@ -18,7 +18,9 @@ from pydantic import BaseModel, Field, ConfigDict
 class SystemState(str, Enum):
     """系统状态枚举"""
     IDLE = "IDLE"           # 空闲状态
+    VISUAL_WAKE = "VISUAL_WAKE"  # 视觉唤醒状态
     LISTENING = "LISTENING"  # 监听状态
+    PROCESSING = "PROCESSING"  # 处理状态（未来用）
     SPEAKING = "SPEAKING"    # 数字人播报状态
 
 
@@ -190,11 +192,18 @@ class KWSConfig(BaseModel):
 
 
 class VADConfig(BaseModel):
-    """VAD配置"""
+    """VAD配置（支持Silero VAD和WebRTC VAD）"""
     enabled: bool = True
-    model: str = "webrtcvad"
-    speech_start_ms: int = 120         # 语音起始阈值（毫秒）
-    speech_end_ms: int = 500           # 语音结束阈值（毫秒）
+    engine: str = "silero"  # VAD引擎："silero" 或 "webrtcvad"
+    model_version: Optional[str] = "v4"  # Silero VAD版本
+    model_name: Optional[str] = "silero_vad"  # Silero VAD模型名称（16kHz）
+    device: str = "cpu"  # 推理设备：强制CPU，避免占用GPU资源
+    threshold: float = 0.5  # 语音概率阈值（0.0-1.0），仅用于Silero VAD
+    sample_rate: int = 16000  # 采样率
+    # 以下字段保留用于向后兼容（已废弃）
+    model: Optional[str] = "webrtcvad"  # 已废弃，由engine替代
+    speech_start_ms: Optional[int] = 120  # 语音起始阈值（毫秒）- 已废弃
+    speech_end_ms: Optional[int] = 500  # 语音结束阈值（毫秒）- 已废弃
 
 
 class VisionConfig(BaseModel):
@@ -221,6 +230,89 @@ class RuntimeConfig(BaseModel):
     health_port: int = 8080            # 健康检查端口
 
 
+class ZMQConfig(BaseModel):
+    """ZMQ通信配置"""
+    vision_pub_port: int = 5555       # 视觉数据发布端口
+    audio_pub_port: int = 5556        # 音频数据发布端口
+    audio_ctrl_port: int = 5557       # 音频控制端口（REQ-REP）
+    req_rep_timeout_ms: int = 2000    # REQ-REP超时时间（毫秒）
+    asr_pull_port: int = 5558         # ASR模块PULL端口（Core Server PUSH到此端口）
+    tts_push_port: int = 5559         # TTS模块PUSH端口（Core Server PULL从此端口接收）
+    tts_stop_pub_port: int = 5560     # TTS停止信号PUB端口（Core Server发布，TTS订阅）
+    core_control_rep_port: int = 5561  # Core Server控制端口（REP，接收LLM指令）
+
+
+class VisionWakeConfig(BaseModel):
+    """视觉唤醒配置"""
+    detection_distance_m: float = 3.0  # 3米内开始检测
+    frontal_percent_threshold: int = 75  # 正面率阈值（%）
+    distance_range: List[float] = Field(default_factory=lambda: [0.1, 3.5])  # 有效距离区间（米）
+    leave_timeout_sec: float = 1.5  # 离开区间持续多久才判定结束（秒）
+    leave_check_frames: int = 20  # 连续N帧不在区间内才判定离开
+    visual_cutoff_enabled: bool = True  # 启用视觉斩断机制（最高优先级打断）
+
+
+class AudioThresholdConfig(BaseModel):
+    """音频动态阈值配置"""
+    default: float = 0.95  # 默认高阈值（无人时）
+    visual_wake: float = 0.4  # 视觉唤醒后的低阈值
+    change_timeout_ms: int = 100  # 阈值修改指令超时（毫秒）
+
+
+class ConversationConfig(BaseModel):
+    """持续对话配置"""
+    vad_silence_timeout_default_sec: float = 8.0  # 默认免唤醒窗口（秒）
+    vad_silence_timeout_extended_sec: float = 15.0  # 未来用于疑问句延长的窗口（秒）
+    vad_check_interval_ms: int = 200  # VAD检查间隔（毫秒）
+    vad_rms_threshold: float = 0.003  # VAD RMS阈值（用于简单VAD检测，低于此值视为静音）
+
+
+class ASRConfig(BaseModel):
+    """ASR配置"""
+    enabled: bool = True
+    engine: str = "funasr"  # ASR引擎
+    model_name: str = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型名称（在线推理模型，完整repo ID）
+    model_path: Optional[str] = "D:/AI_Cache/modelscope/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型路径（本地路径，避免联网下载）
+    sample_rate: int = 16000  # 采样率
+    chunk_size_ms: int = 100  # 流式识别块大小（毫秒）
+    enable_online_inference: bool = True  # 启用在线推理（真正的流式识别）
+    enable_partial_results: bool = True  # 启用中间结果推送（partial_text）
+    use_cache: bool = True  # 启用cache机制（必须启用，否则流式识别会崩溃）
+    timeout_sec: int = 30  # 超时时间（秒）
+
+
+class TTSConfig(BaseModel):
+    """TTS配置（Qwen3-TTS-12Hz-0.6B-Base）"""
+    enabled: bool = True
+    engine: str = "qwen3-tts"  # TTS引擎
+    model_name: str = "Qwen3-TTS-12Hz-0.6B-Base"
+    ref_audio_path: str = "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需）
+    sample_rate: int = 24000  # 采样率（Qwen3-TTS输出为24000Hz）
+    speed: float = 1.0  # 默认语速
+    chunk_size_ms: int = 20  # 音频块大小（毫秒）
+    enable_streaming: bool = True  # 是否启用流式输出
+    punctuation_pattern: str = "[。！？.!?，,]"  # 标点切分正则表达式
+    min_sentence_length: int = 3  # 最小句子长度（字符数），避免过短片段
+    warmup_text: str = "系统初始化"  # 冷启动预热文本
+    warmup_enabled: bool = True  # 是否启用冷启动预热
+
+
+class WebSocketConfig(BaseModel):
+    """WebSocket配置"""
+    asr_port: int = 8766  # ASR WebSocket端口（ASR模块向LLM发送识别结果）
+    tts_port: int = 8767  # TTS WebSocket端口（TTS模块接收LLM的文本消息）
+    core_control_port: int = 8768  # Core Server控制WebSocket端口（可选）
+
+
+class EnvironmentsConfig(BaseModel):
+    """环境配置（用于启动脚本）"""
+    vision: str = "wakefusion_vision"  # 视觉模块Conda环境名
+    audio: str = "wakefusion"  # 音频模块Conda环境名
+    core: str = "wakefusion"  # 核心模块Conda环境名
+    asr: str = "wakefusion"  # ASR模块Conda环境名（可与core相同）
+    tts: str = "wakefusion"  # TTS模块Conda环境名（可与core相同）
+
+
 class AppConfig(BaseModel):
     """应用总配置"""
     audio: AudioConfig = Field(default_factory=AudioConfig)
@@ -229,6 +321,14 @@ class AppConfig(BaseModel):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    zmq: ZMQConfig = Field(default_factory=ZMQConfig)
+    vision_wake: VisionWakeConfig = Field(default_factory=VisionWakeConfig)
+    audio_threshold: AudioThresholdConfig = Field(default_factory=AudioThresholdConfig)
+    conversation: ConversationConfig = Field(default_factory=ConversationConfig)
+    asr: ASRConfig = Field(default_factory=ASRConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
+    websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
+    environments: EnvironmentsConfig = Field(default_factory=EnvironmentsConfig)
 
 
 # ============================================================================

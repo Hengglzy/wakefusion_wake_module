@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WakeFusion ASR WebSocket 测试</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background-color: #1e1e1e; 
+            color: #fff; 
+            padding: 20px; 
+        }
+        .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background: #2d2d2d; 
+            padding: 20px; 
+            border-radius: 10px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+        }
+        .status { 
+            padding: 10px; 
+            border-radius: 5px; 
+            font-weight: bold; 
+            margin-bottom: 20px; 
+            text-align: center; 
+        }
+        .connected { background-color: #2e7d32; color: white; }
+        .disconnected { background-color: #c62828; color: white; }
+        .info-box {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border-left: 4px solid #2196F3;
+        }
+        .result-box {
+            background: #000;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        .result-item {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 4px solid #4caf50;
+        }
+        .result-item.final {
+            border-left-color: #ff9800;
+            background: rgba(255, 152, 0, 0.1);
+        }
+        .result-item.partial {
+            border-left-color: #2196F3;
+            background: rgba(33, 150, 243, 0.1);
+        }
+        .result-text {
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #4caf50;
+            margin-bottom: 5px;
+        }
+        .result-meta {
+            font-size: 0.9em;
+            color: #aaa;
+        }
+        .highlight {
+            color: #00e5ff;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🎤 ASR 语音识别结果监控</h2>
+        
+        <div id="status" class="status disconnected">🔴 未连接 (ws://127.0.0.1:8766)</div>
+        
+        <div class="info-box">
+            <div class="highlight">📡 WebSocket 地址: ws://127.0.0.1:8766</div>
+            <div style="margin-top: 10px; font-size: 0.9em; color: #aaa;">
+                提示：请确保 ASR 模块已启动<br>
+                <code>python -m wakefusion.services.asr_service</code>
+            </div>
+        </div>
+        
+        <div id="results-container" style="display: none;">
+            <h3>📝 识别结果：</h3>
+            <div id="results-box" class="result-box"></div>
+        </div>
+    </div>
+
+    <script>
+        const ws = new WebSocket("ws://127.0.0.1:8766");
+        const statusDiv = document.getElementById('status');
+        const resultsBox = document.getElementById('results-box');
+        const resultsContainer = document.getElementById('results-container');
+        
+        let resultCount = 0;
+
+        ws.onopen = function() {
+            statusDiv.textContent = "🟢 WebSocket 已连接 (ws://127.0.0.1:8766)";
+            statusDiv.className = "status connected";
+            resultsContainer.style.display = "block";
+            resultsBox.innerHTML = "<div style='color: #4caf50;'>等待接收识别结果...</div>";
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === "asr_result") {
+                    resultCount++;
+                    const isFinal = data.is_final;
+                    const resultType = isFinal ? "最终结果" : "中间结果";
+                    const typeClass = isFinal ? "final" : "partial";
+                    const typeIcon = isFinal ? "✅" : "📝";
+                    
+                    const resultItem = document.createElement('div');
+                    resultItem.className = `result-item ${typeClass}`;
+                    resultItem.innerHTML = `
+                        <div class="result-text">${typeIcon} [${resultType}] ${data.text || '(空)'}</div>
+                        <div class="result-meta">
+                            置信度: ${(data.confidence || 0).toFixed(2)} | 
+                            时间戳: ${new Date(data.timestamp * 1000).toLocaleTimeString()} |
+                            序号: #${resultCount}
+                        </div>
+                    `;
+                    
+                    resultsBox.insertBefore(resultItem, resultsBox.firstChild);
+                    
+                    // 限制显示最近50条结果
+                    while (resultsBox.children.length > 50) {
+                        resultsBox.removeChild(resultsBox.lastChild);
+                    }
+                } else {
+                    // 其他类型的消息
+                    const resultItem = document.createElement('div');
+                    resultItem.className = "result-item";
+                    resultItem.innerHTML = `
+                        <div class="result-text">📦 其他消息</div>
+                        <div class="result-meta">${JSON.stringify(data, null, 2)}</div>
+                    `;
+                    resultsBox.insertBefore(resultItem, resultsBox.firstChild);
+                }
+            } catch (e) {
+                console.error("解析消息失败:", e, event.data);
+            }
+        };
+
+        ws.onclose = function() {
+            statusDiv.textContent = "🔴 WebSocket 连接已断开";
+            statusDiv.className = "status disconnected";
+        };
+
+        ws.onerror = function(error) {
+            console.error("WebSocket 发生错误:", error);
+            statusDiv.textContent = "❌ WebSocket 连接错误";
+            statusDiv.className = "status disconnected";
+        };
+    </script>
+</body>
+</html>
