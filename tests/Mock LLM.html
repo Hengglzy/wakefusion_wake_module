@@ -333,20 +333,19 @@
         <p style="color: #aaa; margin-top: -10px;">自动接收 ASR 识别结果并生成随机回复，验证免唤醒链路</p>
 
         <div class="info-box">
-            <div class="highlight">📡 WebSocket 连接信息：</div>
+            <div class="highlight">📡 WebSocket 连接信息 (Relay Mode)：</div>
             <div style="margin-top: 10px; font-size: 0.9em; color: #aaa;">
-                <div>📥 ASR WebSocket: <code>ws://127.0.0.1:8766</code>（接收完整识别结果）</div>
-                <div>📤 TTS WebSocket: <code>ws://127.0.0.1:8767</code>（发送回复文本）</div>
+                <div>接口地址: <code>ws://127.0.0.1:8765</code>（统一网关，连接 <code>mock_llm_server.py</code>）</div>
                 <div style="margin-top: 10px;">
-                    提示：请确保 ASR 和 TTS 模块已启动<br>
-                    <code>python -m wakefusion.services.asr_service</code><br>
-                    <code>python -m wakefusion.services.tts_service</code>
+                    测试流程：<br>
+                    1. 启动 <code>python tests/mock_llm_server.py</code><br>
+                    2. 启动 <code>core_server.py</code> (它会作为 client 连接到 8080)<br>
+                    3. 在此处点击连接按钮
                 </div>
             </div>
         </div>
 
-        <div class="status" id="status-asr">🔴 ASR 未连接</div>
-        <div class="status" id="status-tts">🔴 TTS 未连接</div>
+        <div class="status" id="status-relay">🔴 中继服务器未连接</div>
 
         <!-- 自动回复配置 -->
         <div class="auto-reply-config" id="auto-reply-config">
@@ -409,10 +408,8 @@
     </div>
 
     <script>
-        let asrWs = null;
-        let ttsWs = null;
-        const statusAsrDiv = document.getElementById('status-asr');
-        const statusTtsDiv = document.getElementById('status-tts');
+        let relayWs = null;
+        const statusRelayDiv = document.getElementById('status-relay');
         const asrResultsBox = document.getElementById('asr-results-box');
         const replyInput = document.getElementById('reply-input');
         const logBox = document.getElementById('log-box');
@@ -428,9 +425,7 @@
         let statReplied = 0;
         let totalDelay = 0;
 
-        // ============================================================
-        // 随机回复库：模拟 LLM 的回复内容
-        // ============================================================
+        // ... (RANDOM_REPLIES library stays the same)
         const RANDOM_REPLIES = [
             "好的，我了解了你说的内容。让我帮你处理一下这个问题。",
             "今天天气确实不错，很适合出去走走。",
@@ -449,22 +444,16 @@
             "你好，欢迎使用我们的智能助手！有什么可以帮您的吗？",
         ];
 
-        /**
-         * 获取一条随机回复
-         */
         function getRandomReply() {
             const index = Math.floor(Math.random() * RANDOM_REPLIES.length);
             return RANDOM_REPLIES[index];
         }
 
-        /**
-         * 自动回复：收到最终 ASR 识别结果后自动发送 TTS 回复
-         */
         function autoReply(asrText) {
             if (!autoReplyMode.checked) return;
 
-            if (!ttsWs || ttsWs.readyState !== WebSocket.OPEN) {
-                addLog("⚠️ 自动回复失败：TTS WebSocket 未连接", "warning");
+            if (!relayWs || relayWs.readyState !== WebSocket.OPEN) {
+                addLog("⚠️ 自动回复失败：中继服务器未连接", "warning");
                 return;
             }
 
@@ -473,18 +462,14 @@
 
             addLog(`🤖 自动回复准备中（延迟 ${delay}ms）: "${replyText.substring(0, 30)}..."`, "success");
 
-            // 在 ASR 结果区显示即将自动回复的内容
             const replyPreview = document.createElement('div');
             replyPreview.className = 'result-item auto-reply';
             replyPreview.innerHTML = `
                 <div class="result-text" style="color: #e040fb;">🤖 [自动回复] ${replyText}</div>
-                <div class="result-meta">
-                    针对: "${asrText.substring(0, 50)}" | 延迟: ${delay}ms
-                </div>
+                <div class="result-meta">针对: "${asrText.substring(0, 50)}" | 延迟: ${delay}ms</div>
             `;
             asrResultsBox.insertBefore(replyPreview, asrResultsBox.firstChild);
 
-            // 延迟后发送回复（模拟 LLM 思考时间）
             const startTime = Date.now();
             setTimeout(() => {
                 sendTextToTTS(replyText);
@@ -492,22 +477,17 @@
                 statReplied++;
                 totalDelay += actualDelay;
                 document.getElementById('stat-replied').textContent = statReplied;
-                document.getElementById('stat-avg-delay').textContent =
-                    Math.round(totalDelay / statReplied) + 'ms';
+                document.getElementById('stat-avg-delay').textContent = Math.round(totalDelay / statReplied) + 'ms';
             }, delay);
         }
 
-        /**
-         * 发送文本到 TTS（流式或一次性，取决于设置）
-         */
         function sendTextToTTS(text) {
-            if (!ttsWs || ttsWs.readyState !== WebSocket.OPEN) {
-                addLog("⚠️ TTS WebSocket 未连接", "warning");
+            if (!relayWs || relayWs.readyState !== WebSocket.OPEN) {
+                addLog("⚠️ 中继服务器未连接", "warning");
                 return;
             }
 
             if (streamingMode.checked) {
-                // 流式发送模式：按标点切分
                 const punctuationPattern = /[。！？.!?，,]/;
                 let remainingText = text;
                 let chunkIndex = 0;
@@ -529,71 +509,70 @@
                             is_final: remainingText.length === 0
                         };
 
-                        ttsWs.send(JSON.stringify(message));
+                        relayWs.send(JSON.stringify(message));
                         chunkIndex++;
                         addLog(`📤 发送TTS块 ${chunkIndex}: "${chunk}" (final=${message.is_final})`, "success");
-
-                        // 继续发送下一块
-                        setTimeout(sendNextChunk, 200); // 模拟流式延迟
+                        setTimeout(sendNextChunk, 200);
                     } else {
-                        // 没有标点了，发送剩余文本
                         if (remainingText.length > 0) {
                             const message = {
                                 type: "tts_request",
                                 text: remainingText,
                                 is_final: true
                             };
-                            ttsWs.send(JSON.stringify(message));
+                            relayWs.send(JSON.stringify(message));
                             chunkIndex++;
                             addLog(`📤 发送TTS块 ${chunkIndex}: "${remainingText}" (final=true)`, "success");
                         }
                         addLog("✅ 所有文本块已发送完成", "success");
                     }
                 }
-
                 sendNextChunk();
             } else {
-                // 一次性发送
                 const message = {
                     type: "tts_request",
                     text: text,
                     is_final: true
                 };
-
-                ttsWs.send(JSON.stringify(message));
+                relayWs.send(JSON.stringify(message));
                 addLog(`📤 发送完整回复: "${text}"`, "success");
             }
         }
 
-        function connectASR() {
-            if (asrWs && asrWs.readyState === WebSocket.OPEN) {
-                return; // 已连接
+        function connectRelay() {
+            if (relayWs && relayWs.readyState === WebSocket.OPEN) {
+                return;
             }
 
-            asrWs = new WebSocket("ws://127.0.0.1:8766");
+            relayWs = new WebSocket("ws://127.0.0.1:8765");
 
-            asrWs.onopen = function () {
-                statusAsrDiv.textContent = "🟢 ASR 已连接 (ws://127.0.0.1:8766)";
-                statusAsrDiv.className = "status connected";
-                addLog("✅ ASR WebSocket 连接成功", "success");
+            relayWs.onopen = function () {
+                statusRelayDiv.textContent = "🟢 中继服务器已连接 (ws://127.0.0.1:8765)";
+                statusRelayDiv.className = "status connected";
+                btnSend.disabled = false;
+                btnStop.disabled = false;
+                addLog("✅ 中继服务器连接成功", "success");
             };
 
-            asrWs.onclose = function () {
-                statusAsrDiv.textContent = "🔴 ASR 连接已断开";
-                statusAsrDiv.className = "status disconnected";
-                addLog("🔴 ASR WebSocket 连接已断开", "error");
+            relayWs.onclose = function () {
+                statusRelayDiv.textContent = "🔴 中继服务器已断开";
+                statusRelayDiv.className = "status disconnected";
+                btnSend.disabled = true;
+                btnStop.disabled = true;
+                addLog("🔴 中继服务器连接已断开", "error");
+                // 自动尝试重连
+                // setTimeout(connectRelay, 3000);
             };
 
-            asrWs.onerror = function (error) {
-                statusAsrDiv.textContent = "❌ ASR 连接错误";
-                statusAsrDiv.className = "status disconnected";
-                addLog("❌ ASR WebSocket 连接错误", "error");
+            relayWs.onerror = function (error) {
+                statusRelayDiv.textContent = "❌ 连接错误";
+                statusRelayDiv.className = "status disconnected";
+                addLog("❌ 连接中继服务器出错", "error");
             };
 
-            asrWs.onmessage = function (event) {
+            relayWs.onmessage = function (event) {
                 try {
                     const data = JSON.parse(event.data);
-
                     if (data.type === "asr_result") {
                         const text = data.text || "";
                         const isFinal = data.is_final || false;
@@ -614,69 +593,19 @@
                                 序号: #${asrResultCount}
                             </div>
                         `;
-
                         asrResultsBox.insertBefore(resultItem, asrResultsBox.firstChild);
 
-                        // 限制显示最近50条结果
-                        while (asrResultsBox.children.length > 50) {
-                            asrResultsBox.removeChild(asrResultsBox.lastChild);
-                        }
-
-                        // 统计
                         if (isFinal && text) {
                             statReceived++;
                             document.getElementById('stat-received').textContent = statReceived;
-                            addLog(`📥 收到最终识别结果: "${text}" (置信度: ${confidence.toFixed(2)})`, "success");
-
-                            // 🌟 核心：自动回复
+                            addLog(`📥 收到最终识别结果: "${text}"`, "success");
                             autoReply(text);
                         }
                     } else {
-                        addLog(`📦 收到其他类型消息: ${JSON.stringify(data)}`, "success");
+                        addLog(`📦 收到中继消息: ${JSON.stringify(data)}`, "success");
                     }
                 } catch (e) {
-                    console.error("解析ASR消息失败:", e, event.data);
-                    addLog(`❌ 解析ASR消息失败: ${e.message}`, "error");
-                }
-            };
-        }
-
-        function connectTTS() {
-            if (ttsWs && ttsWs.readyState === WebSocket.OPEN) {
-                return; // 已连接
-            }
-
-            ttsWs = new WebSocket("ws://127.0.0.1:8767");
-
-            ttsWs.onopen = function () {
-                statusTtsDiv.textContent = "🟢 TTS 已连接 (ws://127.0.0.1:8767)";
-                statusTtsDiv.className = "status connected";
-                btnSend.disabled = false;
-                btnStop.disabled = false;
-                addLog("✅ TTS WebSocket 连接成功", "success");
-            };
-
-            ttsWs.onclose = function () {
-                statusTtsDiv.textContent = "🔴 TTS 连接已断开";
-                statusTtsDiv.className = "status disconnected";
-                btnSend.disabled = true;
-                btnStop.disabled = true;
-                addLog("🔴 TTS WebSocket 连接已断开", "error");
-            };
-
-            ttsWs.onerror = function (error) {
-                statusTtsDiv.textContent = "❌ TTS 连接错误";
-                statusTtsDiv.className = "status disconnected";
-                addLog("❌ TTS WebSocket 连接错误", "error");
-            };
-
-            ttsWs.onmessage = function (event) {
-                // TTS模块通常不返回消息，但如果有响应可以在这里处理
-                try {
-                    const data = JSON.parse(event.data);
-                    addLog(`📥 收到TTS响应: ${JSON.stringify(data)}`, "success");
-                } catch (e) {
-                    addLog(`📥 收到TTS消息: ${event.data}`, "success");
+                    addLog(`❌ 解析消息失败: ${e.message}`, "error");
                 }
             };
         }
@@ -687,41 +616,23 @@
             const timestamp = new Date().toLocaleTimeString();
             logItem.textContent = `[${timestamp}] ${message}`;
             logBox.insertBefore(logItem, logBox.firstChild);
-
-            // 限制显示最近100条日志
-            while (logBox.children.length > 100) {
-                logBox.removeChild(logBox.lastChild);
-            }
+            while (logBox.children.length > 100) logBox.removeChild(logBox.lastChild);
         }
 
         function sendReply() {
-            if (!ttsWs || ttsWs.readyState !== WebSocket.OPEN) {
-                addLog("⚠️ TTS WebSocket 未连接", "warning");
-                connectTTS();
-                return;
-            }
-
             const text = replyInput.value.trim();
             if (!text) {
                 addLog("⚠️ 请输入回复内容", "warning");
                 return;
             }
-
             sendTextToTTS(text);
         }
 
         function sendStop() {
-            if (!ttsWs || ttsWs.readyState !== WebSocket.OPEN) {
-                addLog("⚠️ TTS WebSocket 未连接", "warning");
-                return;
-            }
-
-            const message = {
-                type: "stop_synthesis"
-            };
-
-            ttsWs.send(JSON.stringify(message));
-            addLog("� 发送停止合成信号", "warning");
+            if (!relayWs || relayWs.readyState !== WebSocket.OPEN) return;
+            const message = { type: "stop_synthesis" };
+            relayWs.send(JSON.stringify(message));
+            addLog("🛑 发送停止合成信号", "warning");
         }
 
         function clearLog() {
@@ -729,24 +640,20 @@
             addLog("🗑️ 日志已清空", "success");
         }
 
-        // 自动回复模式开关 — 视觉反馈
         autoReplyMode.addEventListener('change', function () {
             if (this.checked) {
                 autoReplyConfig.classList.add('auto-reply-active');
                 addLog("⚡ 自动回复模式已开启", "success");
             } else {
                 autoReplyConfig.classList.remove('auto-reply-active');
-                addLog("⏸️ 自动回复模式已关闭（切换到手动模式）", "warning");
+                addLog("⏸️ 自动回复模式已关闭", "warning");
             }
         });
 
-        // 页面加载时自动连接
         window.onload = function () {
-            connectASR();
-            connectTTS();
-            // 初始状态：自动回复模式开启
+            connectRelay();
             autoReplyConfig.classList.add('auto-reply-active');
-            addLog("� Mock LLM 已启动（自动回复模式）", "success");
+            addLog("🤖 Mock LLM UI 已准备就绪", "success");
         };
     </script>
 </body>

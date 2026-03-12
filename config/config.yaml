@@ -57,6 +57,7 @@ runtime:
   log_level: "INFO"
   websocket_port: 8765  # WebSocket端口
   health_port: 8080  # 健康检查端口
+  processing_timeout_sec: 60  # PROCESSING状态最大等待时间（秒）
 
 # ZMQ 通信配置
 zmq:
@@ -151,5 +152,5 @@ environments:
   vision: "wakefusion_vision"
   audio: "wakefusion"
   core: "wakefusion"
-  asr: "wakefusion"  # ASR模块Conda环境名（可与core相同）
-  tts: "wakefusion"  # TTS模块Conda环境名（可与core相同）
+  asr: "wakefusion_cosyvoice"  # ASR模块Conda环境名（GPU版PyTorch，用于FunASR）
+  tts: "wakefusion_cosyvoice"  # TTS模块Conda环境名（GPU版PyTorch，用于Qwen3-TTS）

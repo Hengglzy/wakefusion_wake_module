@@ -90,17 +90,21 @@ if ($choice -eq "1") {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Service List:" -ForegroundColor Yellow
-    Write-Host "  - Vision Service (Port: 5555)"
-    Write-Host "  - Audio Service (Port: 5556, 5557)"
-    Write-Host "  - ASR Service  (Port: 5558, 8766)"
-    Write-Host "  - TTS Service  (Port: 5559, 8767)"
-    Write-Host "  - Core Server  (Port: 5561)"
+    Write-Host "  - Vision Service (ZMQ Port: 5555)"
+    Write-Host "  - Audio Service (ZMQ Port: 5556, 5557)"
+    Write-Host "  - ASR Service  (ZMQ Port: 5558, 5562)"
+    Write-Host "  - TTS Service  (ZMQ Port: 5559, 5563)"
+    Write-Host "  - Core Server  (ZMQ Port: 5561, WebSocket Client → LLM Agent: 8080)"
     Write-Host ""
     Write-Host "Usage Tips:" -ForegroundColor Yellow
     Write-Host "  - Each service runs in a separate window"
     Write-Host "  - Close the window to stop that service"
     Write-Host "  - Closing this window will NOT stop services"
     Write-Host "  - Run this script again and select option 2 to stop all services"
+    Write-Host ""
+    Write-Host "Note:" -ForegroundColor Yellow
+    Write-Host "  - Core Server will connect to LLM Agent via WebSocket (default: ws://127.0.0.1:8080)"
+    Write-Host "  - Make sure LLM Agent is running before starting Core Server"
     Write-Host ""
     
 } elseif ($choice -eq "2") {

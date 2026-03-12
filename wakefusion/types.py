@@ -228,6 +228,7 @@ class RuntimeConfig(BaseModel):
     log_level: str = "INFO"
     websocket_port: int = 8765         # WebSocket端口
     health_port: int = 8080            # 健康检查端口
+    processing_timeout_sec: int = 60   # PROCESSING状态最大等待时间（秒）
 
 
 class ZMQConfig(BaseModel):

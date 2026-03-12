@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+import queue
 from pathlib import Path
 import zmq
 import numpy as np
@@ -39,8 +40,15 @@ class TTSModule:
         # 熔断机制（使用threading.Event）
         self._stop_event = threading.Event()
         
-        # 字符缓冲区（标点切分）
+        # 文本处理队列（基于句子的异步队列）
+        self.synthesis_queue = queue.Queue()
         self.char_buffer = ""
+        # 标点符号切分正则（支持中英文多种标点）
+        self.punctuation_pattern = re.compile(self.tts_config.punctuation_pattern)
+        
+        # 记录是否正在合成
+        self._is_synthesizing = False
+        self._synthesis_thread: Optional[threading.Thread] = None
         
         # Qwen3-TTS模型
         self.tts = None
@@ -66,11 +74,38 @@ class TTSModule:
         # 冷启动预热
         self._warmup()
         
-        # 启动停止信号监听线程
-        self._start_stop_signal_listener()
-        
-        # 启动文本接收线程
-        self._start_text_receiver()
+    def _start_synthesis_worker(self):
+        """启动后台合成工作线程"""
+        def worker():
+            logger.info("合成工作线程已启动")
+            while self._running:
+                try:
+                    # 获取待合成的文本块，带超时以便检查停止标志
+                    text_chunk, is_final_chunk = self.synthesis_queue.get(timeout=0.1)
+                        
+                    if text_chunk == "END_OF_TTS_SESSION":
+                        # 收到结束信号，发送TTS结束标记
+                        self._send_tts_end_marker()
+                        self.synthesis_queue.task_done()
+                        continue
+                        
+                    self._is_synthesizing = True
+                    try:
+                        self.synthesize_with_cutoff(text_chunk)
+                    except Exception as e:
+                        logger.error(f"合成工作线程异常: {e}")
+                    finally:
+                        self._is_synthesizing = False
+                        self.synthesis_queue.task_done()
+                        
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logger.error(f"合成工作线程出错: {e}")
+                    time.sleep(0.1)
+                    
+        self._synthesis_thread = threading.Thread(target=worker, daemon=True)
+        self._synthesis_thread.start()
     
     def _load_model(self):
         """加载Qwen3-TTS模型（优先使用本地路径，类似ASR模块）"""
@@ -185,8 +220,16 @@ class TTSModule:
                     # 非阻塞接收停止信号
                     message = self.stop_sub_socket.recv_string(zmq.NOBLOCK)
                     if message == "STOP_SYNTHESIS":
-                        logger.warning("收到停止信号，设置停止标志位")
+                        logger.warning("收到停止信号，设置停止标志位，并清空合成队列")
                         self._stop_event.set()  # 设置全局停止标志
+                        self.char_buffer = ""
+                        # 清空合成队列
+                        while not self.synthesis_queue.empty():
+                            try:
+                                self.synthesis_queue.get_nowait()
+                                self.synthesis_queue.task_done()
+                            except queue.Empty:
+                                break
                 except zmq.Again:
                     time.sleep(0.01)
                     continue
@@ -237,33 +280,41 @@ class TTSModule:
     
     def process_streaming_text(self, text_chunk: str, is_final: bool = False):
         """
-        处理流式文本，标点切分
+        处理流式文本，标点切分并放入合成队列
         
         Args:
             text_chunk: 文本块
             is_final: 是否为最后一块文本
         """
-        if self._stop_event.is_set():
-            return  # 如果已停止，忽略新文本
-        
         self.char_buffer += text_chunk
         
-        # 🌟 修复: "标点符号停顿很慢"
-        # 抛弃流式标点切分方案！
-        # 因为 Qwen3-TTS 这种非纯流式的克隆模型，每合成一次都有很大的冷启动成本和上下文割裂感。
-        # 哪怕是完整的句号，切成两半也会让人觉得停顿了5、6秒。
-        # 用户的要求是“是否需要将整个话完全给tts生成” —— 答案是绝对需要！
-        
-        # 我们现在仅仅把大模型的字缓存起来，绝不中途合成
+        # 动态标点切分策略：首句秒发
+        # Qwen3-TTS 具有极速首包响应能力，我们利用它通过尽早发送第一句话来降低TTFA
+        if self.char_buffer:
+            # 查找所有标点符号作为切分点
+            split_points = list(self.punctuation_pattern.finditer(self.char_buffer))
+            
+            if split_points:
+                # 找到最后一个标点符号，将标点及之前的内容作为一个完整的句子放入队列
+                last_split_idx = split_points[-1].end()
+                sentence = self.char_buffer[:last_split_idx].strip()
+                self.char_buffer = self.char_buffer[last_split_idx:]
+                
+                if len(sentence) >= self.tts_config.min_sentence_length or len(sentence) > 0 and len(split_points) == 1:
+                    logger.debug(f"📝 标点切分，将文本放入合成队列: {sentence}")
+                    self.synthesis_queue.put_nowait((sentence, False))
+                else:
+                    self.char_buffer = sentence + self.char_buffer # 如果太短，放回去继续攒 （可选，目前直接发）
         
         # 如果是最后一块文本，处理剩余的缓冲区内容
         if is_final:
-            if self.char_buffer:
-                self.synthesize_with_cutoff(self.char_buffer)
-                self.char_buffer = ""
+            if self.char_buffer.strip():
+                logger.debug(f"📝 最终块，将剩余文本放入合成队列: {self.char_buffer}")
+                self.synthesis_queue.put_nowait((self.char_buffer.strip(), True))
+            self.char_buffer = ""
             
-            # 🌟 新增：发送完整的TTS结束标记，通知Core Server所有合成已完成且播放队列可以安全核算结束
-            self._send_tts_end_marker()
+            # 放入结束标记指令，保证它在所有文本合成完之后执行
+            self.synthesis_queue.put_nowait(("END_OF_TTS_SESSION", True))
     
     def synthesize_with_cutoff(self, text: str):
         """
@@ -372,6 +423,15 @@ class TTSModule:
         """启动TTS模块"""
         self._running = True
         logger.info("TTS模块已启动")
+        
+        # 启动停止信号监听线程
+        self._start_stop_signal_listener()
+        
+        # 启动文本接收线程
+        self._start_text_receiver()
+        
+        # 启动合成工作线程
+        self._start_synthesis_worker()
     
     def stop(self):
         """停止TTS模块"""

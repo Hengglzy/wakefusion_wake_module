@@ -96,15 +96,15 @@ def control_listener_zmq():
                 # 重置缓冲区，防止混入旧声音
                 audio_buffer.fill(0.0)
                 write_pos = 0
+                print("✅ 收到中枢指令：进入免唤醒持续拾音模式 (开始推流)")
                 zmq_rep_socket.send_json({"status": "ok"})
             elif command == "stop_streaming":
                 # 🌟 修复：停止音频推流（进入PROCESSING状态时）
                 is_streaming = False
                 print("🛑 收到停止推流指令，退出流模式")
-                zmq_rep_socket.send_json({"status": "ok"})
                 if vad_engine is not None:
                     vad_engine.reset_states()  # 重置VAD，防止状态残留
-                print("✅ 收到中枢指令：进入免唤醒持续拾音模式")
+                # 注意：只回复一次！删掉后面那些错乱的 print 和 send
                 zmq_rep_socket.send_json({"status": "ok"})
             else:
                 zmq_rep_socket.send_json({"status": "error", "message": "unknown command"})
@@ -230,11 +230,9 @@ def main():
     print("=" * 55)
     print("🎙️  WakeFusion Audio Service")
     print("=" * 55)
-    print("请选择唤醒词模型：")
-    print(f"  1. NeMo MatchboxNet  ({NEMO_MODEL_PATH})")
-    print(f"  2. OpenWakeWord CNN  ({OWW_MODEL_PATH})")
-    choice = input("请输入序号 (直接回车 = 1 NeMo): ").strip()
-    use_oww = (choice == "2")
+    # 🌟 修复：直接默认使用 OpenWakeWord 模型，不再提供选择
+    use_oww = True
+    print(f"使用唤醒词模型: OpenWakeWord CNN ({OWW_MODEL_PATH})")
 
     # ── 加载模型，生成统一的 infer(audio_float32) 闭包 ─────────
     # infer() 接受 float32 音频数组，返回 (label_str, confidence_float)

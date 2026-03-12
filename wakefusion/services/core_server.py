@@ -128,6 +128,12 @@ class CoreServer:
         # 宏微观双重超时管理
         self._user_has_spoken: bool = False  # 用户是否已开口（用于微观超时判断）
         
+        # PROCESSING超时管理
+        self._processing_start_time: float = 0.0
+        self._processing_timeout_sec: float = self.config.runtime.processing_timeout_sec
+        self._processing_timeout_thread: Optional[threading.Thread] = None
+        self._processing_timeout_should_exit: bool = False
+        
         # traceId管理（每次进入LISTENING时生成）
         self._current_trace_id: Optional[str] = None
         
@@ -193,6 +199,11 @@ class CoreServer:
         # ZMQ PUB Socket（发送停止信号给TTS）
         self._tts_stop_pub_socket = self.zmq_context.socket(zmq.PUB)
         self._tts_stop_pub_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.tts_stop_pub_port}")
+        
+        # ZMQ PUSH Socket（发送文本给TTS）
+        self._tts_text_push_socket = self.zmq_context.socket(zmq.PUSH)
+        # 注意：使用 connect 因为 TTS 模块 bind 了这个端口
+        self._tts_text_push_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.tts_text_pull_port}")
     
     def _init_control_socket(self):
         """初始化控制socket（接收LLM指令）"""
@@ -218,6 +229,7 @@ class CoreServer:
     def _websocket_client_worker(self):
         """WebSocket Client工作线程（异步事件循环）"""
         import websockets
+        import websockets.exceptions
         
         # 创建新的事件循环（在独立线程中）
         loop = asyncio.new_event_loop()
@@ -245,7 +257,7 @@ class CoreServer:
                         logger.info("✅ WebSocket已连接")
                         
                         # 发送初始设备状态
-                        await self._send_device_state("idle")
+                        self._report_device_state("idle")
                         
                         # 启动ping任务
                         ping_task = asyncio.create_task(self._ping_worker(websocket, ping_interval))
@@ -284,12 +296,21 @@ class CoreServer:
         try:
             while True:
                 await asyncio.sleep(interval)
-                if websocket.open:
+                # 🌟 修复：直接尝试发送ping，如果连接已关闭会抛出异常
+                try:
                     await websocket.send(json.dumps({"type": "ping"}))
+                except websockets.exceptions.ConnectionClosed:
+                    # 连接已关闭，退出循环
+                    break
+                except AttributeError:
+                    # websocket对象可能已被销毁，退出循环
+                    break
         except asyncio.CancelledError:
+            # 任务被取消（正常情况，当连接关闭时）
             pass
         except Exception as e:
-            logger.error(f"❌ Ping失败: {e}")
+            # 其他异常，记录但不中断主循环
+            logger.debug(f"Ping任务异常（已忽略）: {e}")
     
     async def _handle_websocket_message(self, data: dict):
         """处理从LLM Agent接收的WebSocket消息"""
@@ -299,6 +320,11 @@ class CoreServer:
             # TTS合成请求
             text = data.get("text", "")
             is_final = data.get("isFinal", False)
+            
+            # 🌟 新增：如果当前是PROCESSING状态，收到第一个TTS文本时上报thinking状态
+            if self.current_state == SystemState.PROCESSING and text:
+                self._report_device_state("thinking")
+            
             if text or is_final:
                 # 通过ZMQ发送给TTS模块
                 self._send_tts_text(text, is_final)
@@ -327,7 +353,11 @@ class CoreServer:
             }
             message_json = json.dumps(message, ensure_ascii=False)
             self._tts_text_push_socket.send_string(message_json, zmq.NOBLOCK)
-            logger.debug(f"📤 TTS文本已发送: {text[:20]}... (isFinal={is_final})")
+            # 🌟 修复：使用info级别以便调试
+            if text:
+                logger.info(f"📤 TTS文本已发送: {text[:50]}... (isFinal={is_final})")
+            else:
+                logger.info(f"📤 TTS空文本已发送 (isFinal={is_final})")
         except zmq.Again:
             logger.warning("⚠️ TTS文本队列已满，丢弃消息")
         except Exception as e:
@@ -627,14 +657,17 @@ class CoreServer:
         """转换到IDLE状态
         
         Args:
-            use_abort: 如果为True，使用ABORT_SPEECH标记（用于视觉斩断等废弃场景）
+            use_abort: 如果为True，使用ABORT_SPEECH标记（用于微信等废弃场景）
             skip_marker: 如果为True，跳过发送标记（用于已经在外部发送标记的情况）
         """
         logger.info("状态转换: -> IDLE")
         prev_state = self.current_state
         
-        # 🌟 修复：如果从LISTENING状态转换过来，需要停止音频推流
-        if self.current_state == SystemState.LISTENING:
+        # 停止PROCESSING超时检查器
+        self._processing_timeout_should_exit = True
+        
+        # 🌟 修复：如果从LISTENING/PROCESSING状态转换过来，需要停止音频推流
+        if self.current_state in [SystemState.LISTENING, SystemState.PROCESSING]:
             self._send_stop_streaming_command()
         
         # 🌟 修复：根据前一个状态决定发送END_OF_SPEECH还是ABORT_SPEECH
@@ -794,7 +827,7 @@ class CoreServer:
                 self._send_end_marker()
                 self._send_stop_streaming_command()
                 logger.info("状态转换: LISTENING -> PROCESSING (30秒保底截断)")
-                self.current_state = SystemState.PROCESSING
+                self._transition_to_processing()
                 break
             
             if self._user_has_spoken:
@@ -816,7 +849,7 @@ class CoreServer:
                     self._send_end_marker()
                     self._send_stop_streaming_command()  # 🌟 修复：通知音频服务停止推流
                     logger.info("状态转换: LISTENING -> PROCESSING (VAD截断)")
-                    self.current_state = SystemState.PROCESSING
+                    self._transition_to_processing()
                     break
                 
                 # 🔪 策略 2：视觉强杀！(环境太吵VAD失效，但嘴巴已经死死闭上 2.0s，并且音频VAD至少也安静了0.5s，强行切断)
@@ -826,7 +859,7 @@ class CoreServer:
                     self._send_end_marker()
                     self._send_stop_streaming_command()  # 🌟 修复：通知音频服务停止推流
                     logger.info("状态转换: LISTENING -> PROCESSING (视觉强杀)")
-                    self.current_state = SystemState.PROCESSING
+                    self._transition_to_processing()
                     break
                 
                 # 🔪 策略 3：纯音频兜底 (人没在看屏幕时，或者视觉检测不到嘴巴时，只要音频安静 2.5s 就切断)
@@ -835,7 +868,7 @@ class CoreServer:
                     self._send_end_marker()
                     self._send_stop_streaming_command()  # 🌟 修复：通知音频服务停止推流
                     logger.info("状态转换: LISTENING -> PROCESSING (音频兜底)")
-                    self.current_state = SystemState.PROCESSING
+                    self._transition_to_processing()
                     break
             else:
                 # ⏳ 宏观容器：发呆超时直接关门
@@ -855,6 +888,37 @@ class CoreServer:
             self._transition_to_visual_wake(use_abort=use_abort)
         else:
             self._transition_to_idle(use_abort=use_abort)
+    
+    def _transition_to_processing(self):
+        """转换到PROCESSING状态，并启动看门狗"""
+        logger.info("状态转换: -> PROCESSING")
+        self.current_state = SystemState.PROCESSING
+        self._processing_start_time = time.time()
+        self._processing_timeout_should_exit = False
+        
+        # 上报设备状态
+        self._report_device_state("thinking")
+        
+        if self._processing_timeout_thread is None or not self._processing_timeout_thread.is_alive():
+            self._processing_timeout_thread = threading.Thread(target=self._processing_timeout_checker, daemon=True)
+            self._processing_timeout_thread.start()
+            
+    def _processing_timeout_checker(self):
+        """PROCESSING超时守卫线程：卡死在思考状态时，强制唤醒退回监听/空闲"""
+        logger.info(f"⏱️ [PROCESSING守卫] 启动，超时阈值={self._processing_timeout_sec}秒")
+        while self.current_state == SystemState.PROCESSING:
+            if self._processing_timeout_should_exit:
+                break
+            
+            elapsed = time.time() - self._processing_start_time
+            if elapsed > self._processing_timeout_sec:
+                logger.error(f"🚨 [处理超时] 核心推理/TTS生成卡住超过 {self._processing_timeout_sec} 秒！")
+                logger.error("🛑 触发系统自救协议 -> 强制清退并回到空闲状态")
+                self._handle_hard_cutoff()
+                self._transition_to_idle(use_abort=True)
+                break
+                
+            time.sleep(1.0)
     
     def _transition_to_speaking(self):
         """转换到SPEAKING状态（TTS开始播放）"""
@@ -1280,6 +1344,8 @@ class CoreServer:
                 sockets_to_close.append(self._asr_push_socket)
             if self._tts_pull_socket:
                 sockets_to_close.append(self._tts_pull_socket)
+            if hasattr(self, '_tts_text_push_socket') and self._tts_text_push_socket:
+                sockets_to_close.append(self._tts_text_push_socket)
             if self._tts_stop_pub_socket:
                 sockets_to_close.append(self._tts_stop_pub_socket)
             if self._control_rep_socket:
