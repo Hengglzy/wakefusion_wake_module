@@ -8,6 +8,8 @@ import time
 import threading
 import queue
 import logging
+import uuid
+import asyncio
 from enum import Enum
 from typing import Optional
 from wakefusion.config import get_config
@@ -37,6 +39,7 @@ class CoreServer:
         self.vision_wake_config = self.config.vision_wake
         self.audio_threshold_config = self.config.audio_threshold
         self.conversation_config = self.config.conversation
+        self.llm_agent_config = self.config.llm_agent
         
         # 初始化ZMQ Context
         self.zmq_context = zmq.Context()
@@ -61,6 +64,16 @@ class CoreServer:
         self._asr_push_socket = self.zmq_context.socket(zmq.PUSH)
         self._asr_push_socket.setsockopt(zmq.SNDHWM, 50)  # 最多堆积50个音频块，超过主动丢弃
         self._asr_push_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
+        
+        # ZMQ PULL Socket（接收ASR识别结果）
+        self._asr_result_pull_socket = self.zmq_context.socket(zmq.PULL)
+        self._asr_result_pull_socket.setsockopt(zmq.RCVHWM, 50)  # 接收端限制积压
+        self._asr_result_pull_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.asr_result_push_port}")
+        
+        # ZMQ PUSH Socket（发送TTS合成文本给TTS模块）
+        self._tts_text_push_socket = self.zmq_context.socket(zmq.PUSH)
+        self._tts_text_push_socket.setsockopt(zmq.SNDHWM, 50)  # 发送端限制积压
+        self._tts_text_push_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.tts_text_pull_port}")
         
         # VAD 防抖参数（展厅抗噪核心）
         self._vad_speech_count: int = 0
@@ -87,6 +100,7 @@ class CoreServer:
         self.poller = zmq.Poller()
         self.poller.register(self.vision_sub_socket, zmq.POLLIN)
         self.poller.register(self.audio_sub_socket, zmq.POLLIN)
+        self.poller.register(self._asr_result_pull_socket, zmq.POLLIN)
         
         # 状态管理
         self.current_state = SystemState.IDLE
@@ -114,22 +128,40 @@ class CoreServer:
         # 宏微观双重超时管理
         self._user_has_spoken: bool = False  # 用户是否已开口（用于微观超时判断）
         
+        # traceId管理（每次进入LISTENING时生成）
+        self._current_trace_id: Optional[str] = None
+        
+        # WebSocket Client（统一网关）
+        self._ws_client = None
+        self._ws_connected = False
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        
         # 初始化TTS相关sockets
         self._init_tts_sockets()
         
         # 初始化控制socket
         self._init_control_socket()
         
+        # 初始化WebSocket Client
+        self._init_websocket_client()
+        
         # 启动音频播放线程
         self._start_playback_thread()
+        
+        # 启动ASR结果接收线程
+        self._start_asr_result_receiver()
         
         logger.info("Core Server initialized")
         logger.info(f"  Vision SUB: tcp://127.0.0.1:{self.zmq_config.vision_pub_port}")
         logger.info(f"  Audio SUB: tcp://127.0.0.1:{self.zmq_config.audio_pub_port}")
         logger.info(f"  Audio REQ: tcp://127.0.0.1:{self.zmq_config.audio_ctrl_port}")
+        logger.info(f"  ASR Result PULL: tcp://127.0.0.1:{self.zmq_config.asr_result_push_port}")
+        logger.info(f"  TTS Text PUSH: tcp://127.0.0.1:{self.zmq_config.tts_text_pull_port}")
         logger.info(f"  TTS PULL: tcp://127.0.0.1:{self.zmq_config.tts_push_port}")
         logger.info(f"  TTS STOP PUB: tcp://127.0.0.1:{self.zmq_config.tts_stop_pub_port}")
         logger.info(f"  Control REP: tcp://127.0.0.1:{self.zmq_config.core_control_rep_port}")
+        logger.info(f"  LLM Agent: {self.llm_agent_config.host} (deviceId: {self.llm_agent_config.device_id})")
         logger.info(f"  Initial timeout: {self.current_silence_timeout}s")
     
     def _send_threshold_command(self, threshold: float):
@@ -168,6 +200,248 @@ class CoreServer:
         self._control_rep_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.core_control_rep_port}")
         self._control_rep_socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms超时，非阻塞
         self.poller.register(self._control_rep_socket, zmq.POLLIN)
+    
+    def _init_websocket_client(self):
+        """初始化WebSocket Client（统一网关）"""
+        try:
+            import websockets
+            self._websockets_module = websockets
+        except ImportError:
+            logger.error("❌ websockets未安装，无法连接LLM Agent。请运行: pip install websockets")
+            return
+        
+        # 启动WebSocket Client线程
+        self._ws_thread = threading.Thread(target=self._websocket_client_worker, daemon=True)
+        self._ws_thread.start()
+        logger.info("🌐 WebSocket Client线程已启动")
+    
+    def _websocket_client_worker(self):
+        """WebSocket Client工作线程（异步事件循环）"""
+        import websockets
+        
+        # 创建新的事件循环（在独立线程中）
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._ws_loop = loop
+        
+        # 构建WebSocket URL
+        protocol = "wss" if self.llm_agent_config.use_ssl else "ws"
+        host = self.llm_agent_config.host
+        device_id = self.llm_agent_config.device_id
+        token = self.llm_agent_config.token
+        url = f"{protocol}://{host}/api/voice/ws?deviceId={device_id}&token={token}"
+        
+        reconnect_interval = self.llm_agent_config.reconnect_interval_sec
+        ping_interval = self.llm_agent_config.ping_interval_sec
+        
+        async def client_main():
+            """WebSocket客户端主循环"""
+            while True:
+                try:
+                    logger.info(f"🔌 正在连接LLM Agent: {url}")
+                    async with websockets.connect(url) as websocket:
+                        self._ws_client = websocket
+                        self._ws_connected = True
+                        logger.info("✅ WebSocket已连接")
+                        
+                        # 发送初始设备状态
+                        await self._send_device_state("idle")
+                        
+                        # 启动ping任务
+                        ping_task = asyncio.create_task(self._ping_worker(websocket, ping_interval))
+                        
+                        try:
+                            # 接收消息循环
+                            async for message in websocket:
+                                try:
+                                    data = json.loads(message)
+                                    await self._handle_websocket_message(data)
+                                except json.JSONDecodeError:
+                                    logger.warning(f"⚠️ 无效的JSON消息: {message}")
+                                except Exception as e:
+                                    logger.error(f"❌ 处理WebSocket消息失败: {e}")
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("⚠️ WebSocket连接已关闭")
+                        finally:
+                            ping_task.cancel()
+                            self._ws_connected = False
+                            self._ws_client = None
+                
+                except Exception as e:
+                    logger.error(f"❌ WebSocket连接失败: {e}")
+                    self._ws_connected = False
+                    self._ws_client = None
+                
+                # 重连前等待
+                logger.info(f"⏳ {reconnect_interval}秒后重连...")
+                await asyncio.sleep(reconnect_interval)
+        
+        # 运行事件循环
+        loop.run_until_complete(client_main())
+    
+    async def _ping_worker(self, websocket, interval: float):
+        """Ping保活任务"""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if websocket.open:
+                    await websocket.send(json.dumps({"type": "ping"}))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"❌ Ping失败: {e}")
+    
+    async def _handle_websocket_message(self, data: dict):
+        """处理从LLM Agent接收的WebSocket消息"""
+        msg_type = data.get("type")
+        
+        if msg_type == "route":
+            # TTS合成请求
+            text = data.get("text", "")
+            is_final = data.get("isFinal", False)
+            if text or is_final:
+                # 通过ZMQ发送给TTS模块
+                self._send_tts_text(text, is_final)
+        elif msg_type == "stop_tts":
+            # 停止TTS合成
+            self._send_stop_tts()
+        elif msg_type == "pong":
+            # Ping响应
+            pass
+        elif msg_type == "error":
+            # 错误消息
+            error_msg = data.get("message", "未知错误")
+            logger.error(f"❌ LLM Agent错误: {error_msg}")
+        elif msg_type == "warning":
+            # 警告消息
+            warn_msg = data.get("message", "未知警告")
+            logger.warning(f"⚠️ LLM Agent警告: {warn_msg}")
+    
+    def _send_tts_text(self, text: str, is_final: bool = False):
+        """通过ZMQ发送TTS合成文本给TTS模块"""
+        try:
+            message = {
+                "type": "route",
+                "text": text,
+                "isFinal": is_final
+            }
+            message_json = json.dumps(message, ensure_ascii=False)
+            self._tts_text_push_socket.send_string(message_json, zmq.NOBLOCK)
+            logger.debug(f"📤 TTS文本已发送: {text[:20]}... (isFinal={is_final})")
+        except zmq.Again:
+            logger.warning("⚠️ TTS文本队列已满，丢弃消息")
+        except Exception as e:
+            logger.error(f"❌ 发送TTS文本失败: {e}")
+    
+    def _send_stop_tts(self):
+        """发送停止TTS合成信号"""
+        try:
+            message = {"type": "stop_tts"}
+            message_json = json.dumps(message, ensure_ascii=False)
+            self._tts_text_push_socket.send_string(message_json, zmq.NOBLOCK)
+            logger.info("🛑 已发送停止TTS信号")
+        except Exception as e:
+            logger.error(f"❌ 发送停止TTS信号失败: {e}")
+    
+    def _start_asr_result_receiver(self):
+        """启动ASR识别结果接收线程"""
+        def receiver():
+            logger.info("📥 ASR结果接收线程已启动")
+            while True:
+                try:
+                    # 从ZMQ接收ASR识别结果
+                    message = self._asr_result_pull_socket.recv_string(zmq.NOBLOCK)
+                    try:
+                        data = json.loads(message)
+                        # 处理ASR结果（按照unified-voice-ws-protocol.md格式）
+                        self._handle_asr_result(data)
+                    except json.JSONDecodeError:
+                        logger.warning(f"⚠️ 无效的JSON消息: {message}")
+                    except Exception as e:
+                        logger.error(f"❌ 处理ASR结果失败: {e}")
+                except zmq.Again:
+                    time.sleep(0.01)
+                    continue
+                except Exception as e:
+                    logger.error(f"❌ ASR结果接收线程出错: {e}")
+                    time.sleep(0.1)
+        
+        thread = threading.Thread(target=receiver, daemon=True)
+        thread.start()
+        logger.info("📥 ASR结果接收线程已启动")
+    
+    def _handle_asr_result(self, data: dict):
+        """处理ASR识别结果，转发给LLM Agent"""
+        msg_type = data.get("type")
+        if msg_type != "asr":
+            return
+        
+        stage = data.get("stage")  # "partial" 或 "final"
+        text = data.get("text", "")
+        trace_id = data.get("traceId")
+        confidence = data.get("confidence", 0.0)
+        timestamp = data.get("timestamp", time.time())
+        
+        # 更新当前traceId（如果ASR发送了新的traceId）
+        if trace_id:
+            self._current_trace_id = trace_id
+        
+        # 构建消息（按照unified-voice-ws-protocol.md格式）
+        message = {
+            "type": "asr",
+            "stage": stage,
+            "text": text,
+            "traceId": self._current_trace_id or trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "timestamp": timestamp,
+            "confidence": confidence
+        }
+        
+        # 通过WebSocket发送给LLM Agent
+        self._send_websocket_message(message)
+        
+        # 如果是final结果，进入thinking状态
+        if stage == "final":
+            self._report_device_state("thinking")
+    
+    def _send_websocket_message(self, message: dict):
+        """通过WebSocket发送消息给LLM Agent（线程安全）"""
+        if not self._ws_connected or not self._ws_client or not self._ws_loop:
+            logger.debug("⚠️ WebSocket未连接，跳过消息发送")
+            return
+        
+        try:
+            message_json = json.dumps(message, ensure_ascii=False)
+            # 使用线程安全的方式发送（从ZMQ线程调用WebSocket线程的event loop）
+            asyncio.run_coroutine_threadsafe(
+                self._ws_client.send(message_json),
+                self._ws_loop
+            )
+        except Exception as e:
+            logger.error(f"❌ 发送WebSocket消息失败: {e}")
+    
+    def _report_device_state(self, state: str):
+        """上报设备状态（idle/listening/thinking/speaking）"""
+        message = {
+            "type": "device_state",
+            "state": state,
+            "deviceId": self.llm_agent_config.device_id,
+            "timestamp": time.time()
+        }
+        self._send_websocket_message(message)
+        logger.debug(f"📊 设备状态已上报: {state}")
+    
+    def _send_interrupt(self, trace_id: Optional[str] = None, reason: str = "unknown"):
+        """发送interrupt消息给LLM Agent"""
+        message = {
+            "type": "interrupt",
+            "traceId": trace_id or self._current_trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "reason": reason,
+            "timestamp": time.time()
+        }
+        self._send_websocket_message(message)
+        logger.info(f"🛑 已发送interrupt消息 (traceId={trace_id or self._current_trace_id}, reason={reason})")
     
     def _start_playback_thread(self):
         """启动音频播放线程"""
@@ -266,10 +540,13 @@ class CoreServer:
         """硬打断处理：停止播报，清空队列，发送停止信号"""
         logger.warning("🚨 硬打断：停止播报，清空队列，发送停止信号")
         
-        # 1. 清空播报队列
+        # 1. 发送interrupt消息给LLM Agent
+        self._send_interrupt(reason="barge-in")
+        
+        # 2. 清空播报队列
         self.clear_playback_queue()
         
-        # 2. 向TTS发送停止信号（ZMQ PUB）
+        # 3. 向TTS发送停止信号（ZMQ PUB）
         if self._tts_stop_pub_socket:
             try:
                 self._tts_stop_pub_socket.send_string("STOP_SYNTHESIS", zmq.NOBLOCK)
@@ -382,7 +659,12 @@ class CoreServer:
         # 重置对话轮次和唤醒路径
         self._conversation_round = 0
         self._wake_path = "unknown"
+        # 清空traceId
+        self._current_trace_id = None
         self.current_state = SystemState.IDLE
+        
+        # 上报设备状态
+        self._report_device_state("idle")
     
     def _transition_to_visual_wake(self, use_abort: bool = False):
         """转换到VISUAL_WAKE状态"""
@@ -402,6 +684,10 @@ class CoreServer:
         # 如果从PROCESSING/SPEAKING状态转换过来，触发硬打断
         if self.current_state in [SystemState.PROCESSING, SystemState.SPEAKING]:
             self._handle_hard_cutoff()
+        
+        # 🌟 生成新的traceId（每次进入LISTENING时生成）
+        self._current_trace_id = str(uuid.uuid4())
+        logger.info(f"🆕 新对话轮次开始，生成traceId: {self._current_trace_id}")
         
         # 记录唤醒路径（仅在首次唤醒时记录）
         if self._conversation_round == 0:
@@ -450,6 +736,9 @@ class CoreServer:
             self._vad_timeout_thread.start()
         
         self.current_state = SystemState.LISTENING
+        
+        # 上报设备状态
+        self._report_device_state("listening")
     
     def _send_end_marker(self):
         """发送结束标记给ASR"""
@@ -574,6 +863,9 @@ class CoreServer:
         # 🎙️ 关键：播报时让耳朵重置，回去抓取唤醒词（准备随时硬打断）
         self._send_reset_cooldown_command()
         # conversation_round 保持不变（首次=0，持续对话>=1）
+        
+        # 上报设备状态
+        self._report_device_state("speaking")
     
     def _transition_from_speaking(self):
         """从SPEAKING状态退出（TTS播放结束）"""
@@ -594,6 +886,11 @@ class CoreServer:
     def _handle_visual_cutoff(self, context: str = "监听"):
         """处理视觉斩断（最高优先级打断）"""
         logger.warning(f"🚨 视觉斩断：检测到用户离开，立即切断{context}")
+        
+        # 发送interrupt消息给LLM Agent（如果当前有traceId）
+        if self._current_trace_id:
+            self._send_interrupt(reason="visual-cutoff")
+        
         # 发送中止标记（废弃场景，不进行ASR结算）
         self._send_abort_marker()
         # 停止VAD超时检查线程（如果正在运行）

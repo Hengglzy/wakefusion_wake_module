@@ -69,8 +69,10 @@ zmq:
   req_rep_timeout_ms: 2000  # REQ-REP 超时时间（毫秒）
   
   # ASR/TTS模块端口
-  asr_pull_port: 5558  # ASR模块PULL端口（Core Server PUSH到此端口）
-  tts_push_port: 5559  # TTS模块PUSH端口（Core Server PULL从此端口接收）
+  asr_pull_port: 5558  # ASR模块PULL端口（Core Server PUSH音频到此端口）
+  asr_result_push_port: 5562  # ASR模块PUSH端口（ASR推送识别结果给Core Server）
+  tts_text_pull_port: 5563  # TTS模块PULL端口（TTS接收Core Server的合成文本）
+  tts_push_port: 5559  # TTS模块PUSH端口（Core Server PULL从此端口接收音频）
   tts_stop_pub_port: 5560  # TTS停止信号PUB端口（Core Server发布，TTS订阅）
   core_control_rep_port: 5561  # Core Server控制端口（REP，接收LLM指令）
 
@@ -129,11 +131,20 @@ tts:
   warmup_text: "系统初始化"  # 冷启动预热文本
   warmup_enabled: true  # 是否启用冷启动预热
 
-# WebSocket配置（扩展）
+# LLM Agent 配置（统一WebSocket协议）
+llm_agent:
+  host: "127.0.0.1:8080"  # LLM Agent服务地址（格式：host:port）
+  device_id: "wakefusion-device-01"  # 设备标识
+  token: "your-token-here"  # 认证令牌
+  use_ssl: false  # 是否使用SSL（true for wss://, false for ws://）
+  reconnect_interval_sec: 5.0  # 断线重连间隔（秒）
+  ping_interval_sec: 30.0  # 保活ping间隔（秒）
+
+# WebSocket配置（已废弃，保留用于向后兼容）
 websocket:
-  asr_port: 8766  # ASR WebSocket端口（ASR模块向LLM发送识别结果）
-  tts_port: 8767  # TTS WebSocket端口（TTS模块接收LLM的文本消息）
-  core_control_port: 8768  # Core Server控制WebSocket端口（可选，如果使用WS方案）
+  asr_port: 8766  # 已废弃：ASR WebSocket端口
+  tts_port: 8767  # 已废弃：TTS WebSocket端口
+  core_control_port: 8768  # 已废弃：Core Server控制WebSocket端口
 
 # 环境配置（用于启动脚本）
 environments:

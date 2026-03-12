@@ -236,8 +236,10 @@ class ZMQConfig(BaseModel):
     audio_pub_port: int = 5556        # 音频数据发布端口
     audio_ctrl_port: int = 5557       # 音频控制端口（REQ-REP）
     req_rep_timeout_ms: int = 2000    # REQ-REP超时时间（毫秒）
-    asr_pull_port: int = 5558         # ASR模块PULL端口（Core Server PUSH到此端口）
-    tts_push_port: int = 5559         # TTS模块PUSH端口（Core Server PULL从此端口接收）
+    asr_pull_port: int = 5558         # ASR模块PULL端口（Core Server PUSH音频到此端口）
+    asr_result_push_port: int = 5562  # ASR模块PUSH端口（ASR推送识别结果给Core Server）
+    tts_text_pull_port: int = 5563   # TTS模块PULL端口（TTS接收Core Server的合成文本）
+    tts_push_port: int = 5559         # TTS模块PUSH端口（Core Server PULL从此端口接收音频）
     tts_stop_pub_port: int = 5560     # TTS停止信号PUB端口（Core Server发布，TTS订阅）
     core_control_rep_port: int = 5561  # Core Server控制端口（REP，接收LLM指令）
 
@@ -298,11 +300,21 @@ class TTSConfig(BaseModel):
     warmup_enabled: bool = True  # 是否启用冷启动预热
 
 
+class LLMAgentConfig(BaseModel):
+    """LLM Agent配置（统一WebSocket协议）"""
+    host: str = "127.0.0.1:8080"  # LLM Agent服务地址（格式：host:port）
+    device_id: str = "wakefusion-device-01"  # 设备标识
+    token: str = "your-token-here"  # 认证令牌
+    use_ssl: bool = False  # 是否使用SSL（true for wss://, false for ws://）
+    reconnect_interval_sec: float = 5.0  # 断线重连间隔（秒）
+    ping_interval_sec: float = 30.0  # 保活ping间隔（秒）
+
+
 class WebSocketConfig(BaseModel):
-    """WebSocket配置"""
-    asr_port: int = 8766  # ASR WebSocket端口（ASR模块向LLM发送识别结果）
-    tts_port: int = 8767  # TTS WebSocket端口（TTS模块接收LLM的文本消息）
-    core_control_port: int = 8768  # Core Server控制WebSocket端口（可选）
+    """WebSocket配置（已废弃，保留用于向后兼容）"""
+    asr_port: int = 8766  # 已废弃：ASR WebSocket端口
+    tts_port: int = 8767  # 已废弃：TTS WebSocket端口
+    core_control_port: int = 8768  # 已废弃：Core Server控制WebSocket端口
 
 
 class EnvironmentsConfig(BaseModel):
@@ -328,6 +340,7 @@ class AppConfig(BaseModel):
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    llm_agent: LLMAgentConfig = Field(default_factory=LLMAgentConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
     environments: EnvironmentsConfig = Field(default_factory=EnvironmentsConfig)
 

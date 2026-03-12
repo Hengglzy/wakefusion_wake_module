@@ -1,15 +1,16 @@
 """
 ASR服务模块 - FunASR流式识别
-接收Core Server的音频数据，进行实时语音识别，通过WebSocket发送识别结果给LLM
+接收Core Server的音频数据，进行实时语音识别，通过ZMQ发送识别结果给Core Server
 
 通信协议：
   - ZMQ PULL：接收Core Server的音频数据（tcp://127.0.0.1:{asr_pull_port}）
-  - WebSocket Server：向LLM发送识别文本（ws://0.0.0.0:{asr_ws_port}）
+  - ZMQ PUSH：向Core Server发送识别结果（tcp://127.0.0.1:{asr_result_push_port}）
 """
 import json
 import logging
 import threading
 import time
+import uuid
 import zmq
 import numpy as np
 from typing import Optional, Dict, Any
@@ -31,19 +32,19 @@ class ASRModule:
         self.config = config
         self.asr_config = config.asr
         self.zmq_config = config.zmq
-        self.websocket_config = config.websocket
         
         # FunASR模型和缓存
         self.model = None
         self.cache = {}  # 状态缓存，必须在整个一句话期间维护
         self.text_buffer = ""  # 🌟 修复：新增文本缓存盆，接住增量输出的每一段文字
         
-        # ZMQ和WebSocket
+        # traceId管理（每次START_OF_SPEECH时生成新的traceId）
+        self.current_trace_id: Optional[str] = None
+        
+        # ZMQ
         self.zmq_context = None
         self.pull_socket = None
-        self.ws_server = None
-        self.ws_clients = []  # WebSocket客户端连接列表
-        self.ws_loop = None  # WebSocket线程的event loop引用
+        self.result_push_socket = None  # 推送识别结果给Core Server
         
         # 运行状态
         self._running = False
@@ -52,9 +53,8 @@ class ASRModule:
         # 加载FunASR模型
         self._load_model()
         
-        # 初始化ZMQ和WebSocket
+        # 初始化ZMQ
         self._init_zmq()
-        self._init_websocket()
     
     def _load_model(self):
         """加载FunASR模型（paraformer-zh-online）"""
@@ -99,12 +99,20 @@ class ASRModule:
             self.model = None  # 设置为None，后续会跳过推理
     
     def _init_zmq(self):
-        """初始化ZMQ PULL Socket"""
+        """初始化ZMQ Sockets"""
         self.zmq_context = zmq.Context()
+        
+        # PULL Socket：接收Core Server的音频数据
         self.pull_socket = self.zmq_context.socket(zmq.PULL)
         self.pull_socket.setsockopt(zmq.RCVHWM, 50)  # 接收端限制积压，宁可丢帧也不能让延迟累积
         self.pull_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
         logger.info(f"ZMQ PULL Socket已绑定: tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
+        
+        # PUSH Socket：推送识别结果给Core Server
+        self.result_push_socket = self.zmq_context.socket(zmq.PUSH)
+        self.result_push_socket.setsockopt(zmq.SNDHWM, 50)  # 发送端限制积压
+        self.result_push_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.asr_result_push_port}")
+        logger.info(f"ZMQ PUSH Socket已连接: tcp://127.0.0.1:{self.zmq_config.asr_result_push_port}")
         
         # 订阅带外强杀信号
         self.ctrl_sub_socket = self.zmq_context.socket(zmq.SUB)
@@ -116,91 +124,37 @@ class ASRModule:
         self.poller.register(self.pull_socket, zmq.POLLIN)
         self.poller.register(self.ctrl_sub_socket, zmq.POLLIN)
     
-    def _init_websocket(self):
-        """初始化WebSocket服务器"""
-        try:
-            import websockets
-            from websockets.server import serve
-            
-            async def websocket_handler(websocket, path):
-                """WebSocket连接处理"""
-                logger.info(f"新的WebSocket客户端连接: {websocket.remote_address}")
-                self.ws_clients.append(websocket)
-                try:
-                    async for message in websocket:
-                        # 处理客户端消息（如果需要）
-                        pass
-                except websockets.exceptions.ConnectionClosed:
-                    pass
-                finally:
-                    if websocket in self.ws_clients:
-                        self.ws_clients.remove(websocket)
-                    logger.info(f"WebSocket客户端断开: {websocket.remote_address}")
-            
-            # 启动WebSocket服务器（在独立线程中）
-            import asyncio
-            async def run_ws_server():
-                # 保存event loop引用，供其他线程使用
-                self.ws_loop = asyncio.get_event_loop()
-                async with serve(websocket_handler, "0.0.0.0", self.websocket_config.asr_port):
-                    await asyncio.Future()  # 永久运行
-            
-            self.ws_thread = threading.Thread(
-                target=lambda: asyncio.run(run_ws_server()),
-                daemon=True
-            )
-            self.ws_thread.start()
-            logger.info(f"WebSocket服务器已启动: ws://0.0.0.0:{self.websocket_config.asr_port}")
-        except ImportError:
-            logger.warning("websockets未安装，WebSocket功能将不可用")
-            self.ws_clients = []
-    
-    def _send_to_llm(self, text: str, is_final: bool = False, confidence: float = 0.0):
+    def _send_to_core_server(self, text: str, is_final: bool = False, confidence: float = 0.0):
         """
-        通过WebSocket向LLM发送识别结果
+        通过ZMQ向Core Server发送识别结果
         
         Args:
             text: 识别文本
-            is_final: 是否为最终结果
+            is_final: 是否为最终结果（partial或final）
             confidence: 置信度
         """
-        if not self.ws_clients:
+        if not self.current_trace_id:
+            logger.warning("⚠️ 没有有效的traceId，跳过发送识别结果")
             return
         
+        # 构建消息（按照unified-voice-ws-protocol.md格式）
         message = {
-            "type": "asr_result",
+            "type": "asr",
+            "traceId": self.current_trace_id,
+            "stage": "final" if is_final else "partial",
             "text": text,
-            "is_final": is_final,
             "confidence": confidence,
             "timestamp": time.time()
         }
         
-        message_json = json.dumps(message, ensure_ascii=False)
-        
-        # 向所有连接的客户端广播（线程安全）
-        import asyncio
-        async def broadcast():
-            disconnected = []
-            for client in list(self.ws_clients):  # 创建副本避免迭代时修改
-                try:
-                    await client.send(message_json)
-                except Exception as e:
-                    logger.warning(f"发送WebSocket消息失败: {e}")
-                    disconnected.append(client)
-            
-            # 清理断开的连接
-            for client in disconnected:
-                if client in self.ws_clients:
-                    self.ws_clients.remove(client)
-        
-        # 使用线程安全的方式调用（从音频处理线程调用WebSocket线程的event loop）
-        if self.ws_loop and self.ws_loop.is_running():
-            try:
-                asyncio.run_coroutine_threadsafe(broadcast(), self.ws_loop)
-            except Exception as e:
-                logger.error(f"WebSocket广播失败: {e}")
-        else:
-            logger.warning("WebSocket event loop 不可用，无法发送消息")
+        try:
+            message_json = json.dumps(message, ensure_ascii=False)
+            self.result_push_socket.send_string(message_json, zmq.NOBLOCK)
+            logger.debug(f"📤 ASR识别结果已发送: {text[:20]}... (stage={message['stage']}, traceId={self.current_trace_id[:8]})")
+        except zmq.Again:
+            logger.warning("⚠️ ASR结果队列已满，丢弃消息")
+        except Exception as e:
+            logger.error(f"❌ 发送ASR结果失败: {e}")
     
     def _process_audio_chunk(self, audio_chunk: bytes, is_final: bool = False):
         """
@@ -277,16 +231,23 @@ class ASRModule:
                 if not is_final:
                     logger.debug(f"📝 ASR新增中间结果: {text.strip()} (当前累积: {self.text_buffer})")
             
+            # 发送partial结果（中间结果）
+            if not is_final and text and text.strip():
+                # 发送当前累积的文本作为partial结果
+                partial_text = self.text_buffer.strip()
+                if partial_text:
+                    self._send_to_core_server(partial_text, is_final=False, confidence=confidence)
+            
             # 🌟 结算时发送盆里的所有拼接文字
             if is_final:
                 final_text = self.text_buffer.strip()
                 if final_text:
-                    self._send_to_llm(final_text, is_final=True, confidence=confidence)
+                    self._send_to_core_server(final_text, is_final=True, confidence=confidence)
                     logger.info(f"✅ ASR最终完整识别结果推送: {final_text}")
                 else:
                     logger.info("✅ ASR最终识别结果为空")
                 
-                # 重置状态
+                # 重置状态（保留traceId，直到下一次START_OF_SPEECH）
                 self.cache = {}
                 self.text_buffer = ""
                 logger.info("ASR已结算完毕，清空cache与文字盆")
@@ -327,6 +288,9 @@ class ASRModule:
                     
                     if message == b"START_OF_SPEECH":
                         self.discarding = False
+                        # 🌟 生成新的traceId（每次新的对话轮次）
+                        self.current_trace_id = str(uuid.uuid4())
+                        logger.info(f"🆕 新对话轮次开始，生成traceId: {self.current_trace_id}")
                         # 🌟 修复 Bug #2: 唤醒时发送 START_OF_SPEECH 只是为了解除拒收模式，绝对不可以在此时清空缓存与文字盆！
                         # 因为此时 ASR_service 的 receive 队列里，可能已经积压了 Audio_service 传来的带有这句话开头的 1S 回捞音频
                     elif message == b"END_OF_SPEECH":
@@ -337,6 +301,8 @@ class ASRModule:
                         self.discarding = True
                         self.cache = {}
                         self.text_buffer = ""
+                        # 清空traceId（强杀后重置）
+                        self.current_trace_id = None
                     else:
                         if not self.discarding:
                             self._process_audio_chunk(message, is_final=False)
@@ -363,6 +329,8 @@ class ASRModule:
         # 关闭ZMQ sockets
         if self.pull_socket:
             self.pull_socket.close()
+        if self.result_push_socket:
+            self.result_push_socket.close()
         if hasattr(self, 'ctrl_sub_socket') and self.ctrl_sub_socket:
             self.ctrl_sub_socket.close()
         if self.zmq_context:

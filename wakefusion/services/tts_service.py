@@ -1,9 +1,9 @@
 """
 TTS服务模块 - Qwen3-TTS-12Hz-0.6B-Base
-接收LLM的文本消息，进行语音合成，通过ZMQ PUSH发送音频数据给Core Server
+接收Core Server的文本消息，进行语音合成，通过ZMQ PUSH发送音频数据给Core Server
 
 通信协议：
-  - WebSocket Server：接收LLM的文本消息（ws://0.0.0.0:{tts_ws_port}）
+  - ZMQ PULL：接收Core Server的合成文本（tcp://127.0.0.1:{tts_text_pull_port}）
   - ZMQ PUSH：向Core Server发送音频数据（tcp://127.0.0.1:{tts_push_port}）
   - ZMQ SUB：订阅Core Server的停止信号（tcp://127.0.0.1:{tts_stop_pub_port}）
 """
@@ -17,7 +17,6 @@ from pathlib import Path
 import zmq
 import numpy as np
 from typing import Optional, List
-import asyncio
 from wakefusion.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -36,7 +35,6 @@ class TTSModule:
         self.config = config
         self.tts_config = config.tts
         self.zmq_config = config.zmq
-        self.websocket_config = config.websocket
         
         # 熔断机制（使用threading.Event）
         self._stop_event = threading.Event()
@@ -50,12 +48,11 @@ class TTSModule:
         # 参考音频路径（Voice Clone必需）
         self.ref_audio_path = self.tts_config.ref_audio_path
         
-        # ZMQ和WebSocket
+        # ZMQ
         self.zmq_context = None
-        self.push_socket = None
+        self.text_pull_socket = None  # 接收Core Server的合成文本
+        self.push_socket = None  # 推送音频给Core Server
         self.stop_sub_socket = None
-        self.ws_server = None
-        self.ws_client = None  # 单个LLM客户端连接（点对点模式）
         
         # 运行状态
         self._running = False
@@ -72,8 +69,8 @@ class TTSModule:
         # 启动停止信号监听线程
         self._start_stop_signal_listener()
         
-        # 初始化WebSocket
-        self._init_websocket()
+        # 启动文本接收线程
+        self._start_text_receiver()
     
     def _load_model(self):
         """加载Qwen3-TTS模型（优先使用本地路径，类似ASR模块）"""
@@ -139,6 +136,12 @@ class TTSModule:
         """初始化ZMQ Sockets"""
         self.zmq_context = zmq.Context()
         
+        # ZMQ PULL Socket（接收Core Server的合成文本）
+        self.text_pull_socket = self.zmq_context.socket(zmq.PULL)
+        self.text_pull_socket.setsockopt(zmq.RCVHWM, 50)  # 接收端限制积压
+        self.text_pull_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.tts_text_pull_port}")
+        logger.info(f"ZMQ PULL Socket已绑定: tcp://127.0.0.1:{self.zmq_config.tts_text_pull_port}")
+        
         # ZMQ PUSH Socket（发送音频到Core Server）
         self.push_socket = self.zmq_context.socket(zmq.PUSH)
         self.push_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.tts_push_port}")
@@ -195,74 +198,42 @@ class TTSModule:
         thread.start()
         logger.info("停止信号监听线程已启动")
     
-    def _init_websocket(self):
-        """初始化WebSocket服务器"""
-        try:
-            import websockets
-            from websockets.server import serve
-            
-            async def websocket_handler(websocket, path):
-                """WebSocket连接处理"""
-                logger.info(f"新的WebSocket客户端连接: {websocket.remote_address}")
-                self.ws_client = websocket
-                
+    def _start_text_receiver(self):
+        """启动文本接收线程（从ZMQ接收Core Server的合成文本）"""
+        def receiver():
+            logger.info("文本接收线程已启动")
+            while self._running:
                 try:
-                    async for message in websocket:
-                        # 解析消息
-                        try:
-                            data = json.loads(message)
-                            await self._handle_websocket_message(data)
-                        except json.JSONDecodeError:
-                            logger.warning(f"无效的JSON消息: {message}")
-                        except Exception as e:
-                            logger.error(f"处理WebSocket消息失败: {e}")
-                
-                except websockets.exceptions.ConnectionClosed:
-                    pass
-                finally:
-                    self.ws_client = None
-                    logger.info(f"WebSocket客户端断开: {websocket.remote_address}")
-            
-            # 启动WebSocket服务器（在独立线程中）
-            async def run_ws_server():
-                async with serve(websocket_handler, "0.0.0.0", self.websocket_config.tts_port):
-                    await asyncio.Future()  # 永久运行
-            
-            self.ws_thread = threading.Thread(
-                target=lambda: asyncio.run(run_ws_server()),
-                daemon=True
-            )
-            self.ws_thread.start()
-            logger.info(f"WebSocket服务器已启动: ws://0.0.0.0:{self.websocket_config.tts_port}")
+                    # 从ZMQ接收文本消息
+                    message = self.text_pull_socket.recv_string(zmq.NOBLOCK)
+                    try:
+                        data = json.loads(message)
+                        # 处理消息（按照unified-voice-ws-protocol.md格式）
+                        msg_type = data.get("type")
+                        if msg_type == "route":
+                            # TTS合成请求
+                            text = data.get("text", "")
+                            is_final = data.get("isFinal", False)
+                            if text or is_final:
+                                self.process_streaming_text(text, is_final=is_final)
+                        elif msg_type == "stop_tts":
+                            # 停止合成
+                            logger.warning("收到停止合成信号")
+                            self._stop_event.set()
+                    except json.JSONDecodeError:
+                        logger.warning(f"无效的JSON消息: {message}")
+                    except Exception as e:
+                        logger.error(f"处理文本消息失败: {e}")
+                except zmq.Again:
+                    time.sleep(0.01)
+                    continue
+                except Exception as e:
+                    logger.error(f"文本接收线程出错: {e}")
+                    time.sleep(0.1)
         
-        except ImportError:
-            logger.warning("websockets未安装，WebSocket功能将不可用")
-            self.ws_client = None
-    
-    async def _handle_websocket_message(self, data: dict):
-        """
-        处理WebSocket消息
-        
-        Args:
-            data: 消息数据（JSON格式）
-        """
-        msg_type = data.get("type")
-        
-        if msg_type == "tts_request":
-            # TTS请求
-            text = data.get("text", "")
-            is_streaming = data.get("is_streaming", True)
-            is_final = data.get("is_final", False)
-            
-            if text or is_final:
-                # 🌟 修复：在独立线程中处理合成，避免阻塞 WebSocket 事件循环导致断开
-                # 使用 await asyncio.to_thread 会释放 GIL，让事件循环能正常响应心跳
-                await asyncio.to_thread(self.process_streaming_text, text, is_final=is_final)
-        
-        elif msg_type == "stop_synthesis":
-            # 停止合成
-            logger.warning("收到WebSocket停止信号")
-            self._stop_event.set()
+        thread = threading.Thread(target=receiver, daemon=True)
+        thread.start()
+        logger.info("文本接收线程已启动")
     
     def process_streaming_text(self, text_chunk: str, is_final: bool = False):
         """
@@ -408,6 +379,8 @@ class TTSModule:
         self._stop_event.set()  # 设置停止标志
         
         # 关闭ZMQ sockets
+        if self.text_pull_socket:
+            self.text_pull_socket.close()
         if self.push_socket:
             self.push_socket.close()
         if self.stop_sub_socket:

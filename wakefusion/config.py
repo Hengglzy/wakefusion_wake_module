@@ -120,6 +120,10 @@ class ConfigManager:
         """获取WebSocket配置"""
         return self.config.websocket
     
+    def get_llm_agent_config(self):
+        """获取LLM Agent配置"""
+        return self.config.llm_agent
+    
     def get_vad_config(self):
         """获取VAD配置"""
         return self.config.vad
