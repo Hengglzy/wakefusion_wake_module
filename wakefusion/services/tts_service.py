@@ -9,12 +9,15 @@ TTS服务模块 - Qwen3-TTS-12Hz-0.6B-Base
 """
 import json
 import logging
+import os
 import re
 import threading
 import time
+from pathlib import Path
 import zmq
 import numpy as np
 from typing import Optional, List
+import asyncio
 from wakefusion.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -73,16 +76,58 @@ class TTSModule:
         self._init_websocket()
     
     def _load_model(self):
-        """加载Qwen3-TTS模型"""
+        """加载Qwen3-TTS模型（优先使用本地路径，类似ASR模块）"""
         try:
             logger.info(f"正在加载Qwen3-TTS模型: {self.tts_config.model_name}...")
             from qwen_tts import Qwen3TTSModel
             
-            self.tts = Qwen3TTSModel.from_pretrained(
-                "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-                device_map="cuda:0"  # 强制GPU
-            )
-            logger.info("Qwen3-TTS模型加载成功")
+            # 加载模型（Qwen3-TTS支持本地路径和HuggingFace模型名称）
+            # 如果配置了model_path，使用本地路径；否则使用模型名称自动下载
+            if self.tts_config.model_path and self.tts_config.model_path.strip():
+                model_path = self.tts_config.model_path.strip()
+                logger.info(f"使用本地模型路径: {model_path}")
+                
+                # 🌟 修复：自动查找 HuggingFace 缓存目录中的 snapshots 子目录
+                # HuggingFace 缓存结构：models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/<hash>/
+                if os.path.isdir(model_path):
+                    snapshots_dir = os.path.join(model_path, "snapshots")
+                    if os.path.isdir(snapshots_dir):
+                        # 查找 snapshots 下的第一个子目录（通常是 hash 命名的目录）
+                        snapshot_dirs = [d for d in os.listdir(snapshots_dir) 
+                                        if os.path.isdir(os.path.join(snapshots_dir, d))]
+                        if snapshot_dirs:
+                            # 使用第一个找到的 snapshots 目录
+                            actual_model_path = os.path.join(snapshots_dir, snapshot_dirs[0])
+                            logger.info(f"自动定位到 snapshots 目录: {actual_model_path}")
+                            model_path = actual_model_path
+                        else:
+                            logger.warning(f"snapshots 目录为空，尝试使用根目录: {model_path}")
+                    else:
+                        # 如果已经是 snapshots 下的目录，直接使用
+                        logger.info(f"使用提供的路径（可能是 snapshots 子目录）: {model_path}")
+                
+                # 检查路径是否存在，如果存在则强制离线模式
+                is_local_dir = os.path.isdir(model_path)
+                if not is_local_dir:
+                    logger.error(f"模型路径不存在: {model_path}")
+                    raise FileNotFoundError(f"模型路径不存在: {model_path}")
+                
+                logger.info(f"最终使用模型路径: {model_path} (local_files_only={is_local_dir})")
+                
+                self.tts = Qwen3TTSModel.from_pretrained(
+                    model_path,
+                    device_map="cuda:0",  # 强制GPU
+                    local_files_only=is_local_dir  # 🌟 如果是本地目录，强制离线模式，绝不联网
+                )
+            else:
+                # 使用模型名称，Qwen3-TTS会自动从HuggingFace下载
+                logger.info(f"使用模型名称自动下载: {self.tts_config.model_name}")
+                self.tts = Qwen3TTSModel.from_pretrained(
+                    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                    device_map="cuda:0"  # 强制GPU
+                )
+            
+            logger.info("✅ Qwen3-TTS模型加载成功")
         except ImportError:
             logger.error("qwen-tts包未安装，请运行: pip install qwen-tts")
             raise
@@ -155,7 +200,6 @@ class TTSModule:
         try:
             import websockets
             from websockets.server import serve
-            import asyncio
             
             async def websocket_handler(websocket, path):
                 """WebSocket连接处理"""
@@ -210,9 +254,10 @@ class TTSModule:
             is_streaming = data.get("is_streaming", True)
             is_final = data.get("is_final", False)
             
-            if text:
-                # 处理流式文本（标点切分）
-                self.process_streaming_text(text, is_final=is_final)
+            if text or is_final:
+                # 🌟 修复：在独立线程中处理合成，避免阻塞 WebSocket 事件循环导致断开
+                # 使用 await asyncio.to_thread 会释放 GIL，让事件循环能正常响应心跳
+                await asyncio.to_thread(self.process_streaming_text, text, is_final=is_final)
         
         elif msg_type == "stop_synthesis":
             # 停止合成
@@ -232,26 +277,22 @@ class TTSModule:
         
         self.char_buffer += text_chunk
         
-        # 标点检测正则
-        punctuation_pattern = re.compile(r'[。！？.!?，,]')
+        # 🌟 修复: "标点符号停顿很慢"
+        # 抛弃流式标点切分方案！
+        # 因为 Qwen3-TTS 这种非纯流式的克隆模型，每合成一次都有很大的冷启动成本和上下文割裂感。
+        # 哪怕是完整的句号，切成两半也会让人觉得停顿了5、6秒。
+        # 用户的要求是“是否需要将整个话完全给tts生成” —— 答案是绝对需要！
         
-        while True:
-            match = punctuation_pattern.search(self.char_buffer)
-            if not match:
-                break
-            
-            # 截取到标点符号的短句
-            sentence = self.char_buffer[:match.end()]
-            self.char_buffer = self.char_buffer[match.end():]
-            
-            # 合成并发送（带熔断机制）
-            self.synthesize_with_cutoff(sentence)
+        # 我们现在仅仅把大模型的字缓存起来，绝不中途合成
         
         # 如果是最后一块文本，处理剩余的缓冲区内容
-        if is_final and self.char_buffer:
-            if len(self.char_buffer) >= self.tts_config.min_sentence_length:
+        if is_final:
+            if self.char_buffer:
                 self.synthesize_with_cutoff(self.char_buffer)
-            self.char_buffer = ""
+                self.char_buffer = ""
+            
+            # 🌟 新增：发送完整的TTS结束标记，通知Core Server所有合成已完成且播放队列可以安全核算结束
+            self._send_tts_end_marker()
     
     def synthesize_with_cutoff(self, text: str):
         """
@@ -338,6 +379,23 @@ class TTSModule:
             pass
         except Exception as e:
             logger.error(f"发送音频块失败: {e}")
+            
+    def _send_tts_end_marker(self):
+        """发送整段TTS结束标记"""
+        try:
+            metadata = {
+                "type": "tts_end",
+                "timestamp": time.time()
+            }
+            # 发送空的二进制数据
+            empty_audio = b""
+            self.push_socket.send_multipart([
+                json.dumps(metadata).encode('utf-8'),
+                empty_audio
+            ], zmq.NOBLOCK)
+            logger.info("✅ 已发送整段TTS结束标记给Core Server")
+        except Exception as e:
+            logger.error(f"发送TTS结束标记异常: {e}")
     
     def start(self):
         """启动TTS模块"""
@@ -369,9 +427,10 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # 加载配置
-    config = get_config()
+    # 加载配置：显式指定项目根目录下的 config.yaml，确保读取到自定义的 model_path
+    project_root = Path(__file__).resolve().parents[2]
+    config_path = project_root / "config" / "config.yaml"
+    config = get_config(str(config_path))
     
     # 创建TTS模块
     tts_module = TTSModule(config)

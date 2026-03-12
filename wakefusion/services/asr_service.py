@@ -36,6 +36,7 @@ class ASRModule:
         # FunASR模型和缓存
         self.model = None
         self.cache = {}  # 状态缓存，必须在整个一句话期间维护
+        self.text_buffer = ""  # 🌟 修复：新增文本缓存盆，接住增量输出的每一段文字
         
         # ZMQ和WebSocket
         self.zmq_context = None
@@ -46,6 +47,7 @@ class ASRModule:
         
         # 运行状态
         self._running = False
+        self.discarding = False  # 拒收模式：强杀后丢弃所有音频
         
         # 加载FunASR模型
         self._load_model()
@@ -103,6 +105,16 @@ class ASRModule:
         self.pull_socket.setsockopt(zmq.RCVHWM, 50)  # 接收端限制积压，宁可丢帧也不能让延迟累积
         self.pull_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
         logger.info(f"ZMQ PULL Socket已绑定: tcp://127.0.0.1:{self.zmq_config.asr_pull_port}")
+        
+        # 订阅带外强杀信号
+        self.ctrl_sub_socket = self.zmq_context.socket(zmq.SUB)
+        self.ctrl_sub_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.tts_stop_pub_port}")
+        self.ctrl_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "ABORT_ASR")
+        
+        # 使用 Poller 监听双通道
+        self.poller = zmq.Poller()
+        self.poller.register(self.pull_socket, zmq.POLLIN)
+        self.poller.register(self.ctrl_sub_socket, zmq.POLLIN)
     
     def _init_websocket(self):
         """初始化WebSocket服务器"""
@@ -215,7 +227,10 @@ class ASRModule:
             if is_final:
                 # FunASR 不接受 None，如果是空数组，喂给它一段微小的静音来安全触发结算
                 if len(audio_array) == 0:
-                    audio_array = np.zeros(160, dtype=np.int16)  # 10ms 静音（16kHz * 0.01s = 160）
+                    # 🌟 修复：尾音截断问题。FunASR 需要足够的尾部静音来把最后一个字的拼音吐出来
+                    # 如果只给 10ms，它可能觉得还没说完就直接结算，丢掉最后一个词
+                    # 这里给它补充 ~300ms 的静音数据 (16kHz * 0.3s = 4800 采样点)
+                    audio_array = np.zeros(4800, dtype=np.int16)
                 
                 # 最终结果：设置is_final=True获取完整识别文本
                 res = self.model.generate(
@@ -255,47 +270,81 @@ class ASRModule:
                 confidence = 0.95
             
             # 发送识别结果（如果有文本）
+            # 🌟 修复：增量拼接，FunASR 会一段段吐出已确认的文字，并把缓存清除
+            # 我们必须用一个 "文字拼接盆" 接住所有中间片断，最后一起发给 LLM
             if text and text.strip():
-                self._send_to_llm(text.strip(), is_final=is_final, confidence=confidence)
-                if is_final:
-                    logger.info(f"✅ ASR最终识别结果: {text.strip()}")
-                else:
-                    logger.debug(f"📝 ASR中间结果: {text.strip()}")
+                self.text_buffer += text.strip()
+                if not is_final:
+                    logger.debug(f"📝 ASR新增中间结果: {text.strip()} (当前累积: {self.text_buffer})")
             
-            # 如果是最终结果，重置cache
+            # 🌟 结算时发送盆里的所有拼接文字
             if is_final:
+                final_text = self.text_buffer.strip()
+                if final_text:
+                    self._send_to_llm(final_text, is_final=True, confidence=confidence)
+                    logger.info(f"✅ ASR最终完整识别结果推送: {final_text}")
+                else:
+                    logger.info("✅ ASR最终识别结果为空")
+                
+                # 重置状态
                 self.cache = {}
-                logger.info("ASR识别完成，已重置cache")
+                self.text_buffer = ""
+                logger.info("ASR已结算完毕，清空cache与文字盆")
         
         except Exception as e:
             logger.error(f"FunASR推理失败: {e}")
             # 如果是最终结果，即使出错也要重置cache
             if is_final:
                 self.cache = {}
-                logger.warning("ASR推理出错，已重置cache")
+                self.text_buffer = ""
+                logger.warning("ASR推理出错，已强制重置cache")
     
     def process_audio_stream(self):
         """处理音频流（主循环）"""
         logger.info("开始处理音频流...")
-        
         while self._running:
             try:
-                # 接收音频数据（阻塞）
-                message = self.pull_socket.recv()
+                socks = dict(self.poller.poll(timeout=100))
                 
-                if message == b"END_OF_SPEECH":
-                    # 收到结束标记，设置is_final=True获取最终结果
-                    logger.info("收到END_OF_SPEECH标记，获取最终识别结果")
-                    self._process_audio_chunk(b"", is_final=True)
-                else:
-                    # 实时在线推理，不累积
-                    self._process_audio_chunk(message, is_final=False)
-            
+                # 1. 优先处理带外强杀
+                if getattr(self, 'ctrl_sub_socket', None) in socks:
+                    ctrl_msg = self.ctrl_sub_socket.recv_string(zmq.NOBLOCK)
+                    if "ABORT_ASR" in ctrl_msg:
+                        logger.info("🚨 收到带外强杀信号，进入拒收模式并清空队列！")
+                        self.discarding = True
+                        self.cache = {}
+                        self.text_buffer = ""
+                        while True:
+                            try:
+                                self.pull_socket.recv(zmq.NOBLOCK)
+                            except zmq.Again:
+                                break
+                        continue
+                
+                # 2. 正常处理音频流
+                if self.pull_socket in socks:
+                    message = self.pull_socket.recv(zmq.NOBLOCK)
+                    
+                    if message == b"START_OF_SPEECH":
+                        self.discarding = False
+                        # 🌟 修复 Bug #2: 唤醒时发送 START_OF_SPEECH 只是为了解除拒收模式，绝对不可以在此时清空缓存与文字盆！
+                        # 因为此时 ASR_service 的 receive 队列里，可能已经积压了 Audio_service 传来的带有这句话开头的 1S 回捞音频
+                    elif message == b"END_OF_SPEECH":
+                        if not self.discarding:
+                            logger.info("收到END_OF_SPEECH，获取最终识别结果")
+                            self._process_audio_chunk(b"", is_final=True)
+                    elif message == b"ABORT_SPEECH":
+                        self.discarding = True
+                        self.cache = {}
+                        self.text_buffer = ""
+                    else:
+                        if not self.discarding:
+                            self._process_audio_chunk(message, is_final=False)
+                        
             except zmq.Again:
                 continue
             except Exception as e:
                 logger.error(f"处理音频流时出错: {e}")
-                continue
     
     def start(self):
         """启动ASR模块"""
@@ -314,6 +363,8 @@ class ASRModule:
         # 关闭ZMQ sockets
         if self.pull_socket:
             self.pull_socket.close()
+        if hasattr(self, 'ctrl_sub_socket') and self.ctrl_sub_socket:
+            self.ctrl_sub_socket.close()
         if self.zmq_context:
             self.zmq_context.term()
         
@@ -323,6 +374,7 @@ class ASRModule:
 def main():
     """ASR模块主入口"""
     import logging
+    from pathlib import Path
     
     # 配置日志
     logging.basicConfig(
@@ -330,8 +382,10 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # 加载配置
-    config = get_config()
+    # 🌟 修复：显式指定项目根目录下的 config.yaml，确保读取到自定义配置
+    project_root = Path(__file__).resolve().parents[2]
+    config_path = project_root / "config" / "config.yaml"
+    config = get_config(str(config_path))
     
     # 创建ASR模块
     asr_module = ASRModule(config)

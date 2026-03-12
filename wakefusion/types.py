@@ -254,14 +254,14 @@ class VisionWakeConfig(BaseModel):
 
 class AudioThresholdConfig(BaseModel):
     """音频动态阈值配置"""
-    default: float = 0.95  # 默认高阈值（无人时）
-    visual_wake: float = 0.4  # 视觉唤醒后的低阈值
+    default: float = 0.85  # 默认高阈值（无人时）
+    visual_wake: float = 0.6  # 视觉唤醒后的低阈值
     change_timeout_ms: int = 100  # 阈值修改指令超时（毫秒）
 
 
 class ConversationConfig(BaseModel):
     """持续对话配置"""
-    vad_silence_timeout_default_sec: float = 8.0  # 默认免唤醒窗口（秒）
+    vad_silence_timeout_default_sec: float = 3.0  # 默认免唤醒窗口（秒）
     vad_silence_timeout_extended_sec: float = 15.0  # 未来用于疑问句延长的窗口（秒）
     vad_check_interval_ms: int = 200  # VAD检查间隔（毫秒）
     vad_rms_threshold: float = 0.003  # VAD RMS阈值（用于简单VAD检测，低于此值视为静音）
@@ -286,6 +286,7 @@ class TTSConfig(BaseModel):
     enabled: bool = True
     engine: str = "qwen3-tts"  # TTS引擎
     model_name: str = "Qwen3-TTS-12Hz-0.6B-Base"
+    model_path: Optional[str] = ""  # TTS模型路径（本地路径，避免联网下载，留空则使用model_name自动下载）
     ref_audio_path: str = "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需）
     sample_rate: int = 24000  # 采样率（Qwen3-TTS输出为24000Hz）
     speed: float = 1.0  # 默认语速

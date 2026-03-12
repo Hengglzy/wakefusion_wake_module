@@ -19,12 +19,14 @@ import numpy as np
 import time
 import socket
 import json
+import zmq
 from collections import deque
 from typing import Optional, Dict, Any, Tuple
 
 # 导入 WakeFusion 组件（业务门控）
 from wakefusion.workers import FaceGateWorker, FaceGateConfig
 from wakefusion.types import VisionFrame
+from wakefusion.config import get_config
 
 
 # ============================================================================
@@ -33,9 +35,13 @@ from wakefusion.types import VisionFrame
 
 # UDP 配置（方案B：GUI 仅接收，不占用摄像头）
 UDP_HOST = "127.0.0.1"
-UDP_JSON_PORT = 9999     # vision_service.py 发送 JSON（坐标/手势）
+UDP_JSON_PORT = 9999     # FaceGate / 旧版视觉 JSON（坐标/手势）
 UDP_IMG_PORT = 10000     # vision_service.py 发送 JPEG 图像（分包）
 UDP_DEPTH_PORT = 10001   # vision_service.py 发送深度彩色图（分包 JPEG）
+
+# ZMQ 配置：从全局配置中读取 Vision PUB 端口，避免端口冲突/硬编码
+_CONFIG = get_config()
+VISION_PUB_PORT = _CONFIG.zmq.vision_pub_port
 
 # 显示配置
 WINDOW_NAME = "WakeFusion Vision Monitor"
@@ -526,21 +532,28 @@ class UdpVisionReceiver:
 # 三层可视化看板
 # ============================================================================
 
-def render_layer1_hardware(frame: np.ndarray, fps: float, device_status: str, is_valid: bool = False):
+def render_layer1_hardware(
+    frame: np.ndarray,
+    fps: float,
+    device_status: str,
+    is_valid: bool = False,
+    is_talking: bool = False,
+):
     """
     层1 - 硬件监控（右上角，简洁样式）
-    显示 FPS 和 Wake Status
+    显示 FPS、Wake 状态和唇动检测状态
     
     Args:
         frame: 图像帧
         fps: 当前帧率
         device_status: 设备状态字符串
         is_valid: 是否处于唤醒就绪状态
+        is_talking: 唇动检测结果（来自 vision_service 的 is_talking）
     """
     h, w = frame.shape[:2]
     
     # 右上角半透明背景框（更简洁）
-    box_w, box_h = 160, 60
+    box_w, box_h = 200, 80
     box_x, box_y = w - box_w - 10, 10
     draw_transparent_rect(frame, box_x, box_y, box_w, box_h, COLOR_BLACK, 0.7)
     
@@ -560,6 +573,12 @@ def render_layer1_hardware(frame: np.ndarray, fps: float, device_status: str, is
     
     cv2.putText(frame, status_text, (box_x + 10, box_y + 50), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1, cv2.LINE_AA)
+
+    # 唇动检测状态
+    lip_text = "Lip: TALKING" if is_talking else "Lip: SILENT"
+    lip_color = COLOR_GREEN if is_talking else COLOR_GRAY
+    cv2.putText(frame, lip_text, (box_x + 10, box_y + 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, lip_color, 1, cv2.LINE_AA)
 
 
 def render_layer2_perception(frame: np.ndarray, has_presence: bool, 
@@ -698,6 +717,16 @@ def main():
     # 正在初始化（方案B：UDP 接收模式，不占用摄像头）...
     receiver = UdpVisionReceiver(host=UDP_HOST, img_port=UDP_IMG_PORT, depth_port=UDP_DEPTH_PORT)
 
+    # ZMQ 订阅：直接从 vision_service 的 PUB 通道获取原始感知结果（含唇动 is_talking）
+    zmq_ctx = zmq.Context()
+    vision_sub = zmq_ctx.socket(zmq.SUB)
+    vision_sub.connect(f"tcp://127.0.0.1:{VISION_PUB_PORT}")
+    # 订阅全部主题（vision_service 发送的是纯 JSON）
+    vision_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+    vision_sub.setsockopt(zmq.RCVTIMEO, 0)  # 非阻塞
+
+    latest_is_talking = False
+
     # FaceGate（业务逻辑：从 UDP JSON 读取 faces/gesture/距离，输出 valid 状态）
     face_gate = FaceGateWorker(
         config=FaceGateConfig(
@@ -735,6 +764,16 @@ def main():
         # 如果 VisionService 已通过 VisionServiceControl 窗口按 'q' 退出，
         # 将在若干秒内检测到图像停止更新并自动关闭 GUI。
         while True:
+            # 先尝试从 ZMQ 读取最新的视觉感知结果（含唇动 is_talking）
+            try:
+                while True:
+                    msg = vision_sub.recv_json(flags=zmq.NOBLOCK)
+                    # vision_service.py send_result 中的字段：
+                    # {"wake": bool, "faces": [...], "hands": [...], "is_talking": bool, "timestamp": float}
+                    latest_is_talking = bool(msg.get("is_talking", False))
+            except zmq.Again:
+                pass
+
             img_bgr, depth_bgr = receiver.poll()
 
             # 若长时间未收到新的 RGB 帧，认为 VisionService 已退出，自动结束 GUI
@@ -911,8 +950,8 @@ def main():
                     cv2.LINE_AA
                 )
             
-            # 层1 - 硬件监控（右上角，简洁样式）
-            render_layer1_hardware(display_frame, current_fps, "UDP", is_valid)
+            # 层1 - 硬件监控（右上角，简洁样式）+ 唇动检测状态
+            render_layer1_hardware(display_frame, current_fps, "UDP", is_valid, latest_is_talking)
 
             # 深度画中画（右下角）
             if depth_bgr is not None:
@@ -953,6 +992,11 @@ def main():
         cv2.destroyAllWindows()
         receiver.close()
         face_gate.stop()
+        try:
+            vision_sub.close()
+            zmq_ctx.term()
+        except Exception:
+            pass
         
         # 总帧数和退出信息已通过日志系统记录
 

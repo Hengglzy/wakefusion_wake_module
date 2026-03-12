@@ -85,13 +85,13 @@ vision_wake:
 
 # 音频动态阈值配置
 audio_threshold:
-  default: 0.95  # 默认高阈值（无人时）
-  visual_wake: 0.4  # 视觉唤醒后的低阈值
+  default: 0.85  # 默认高阈值（无人时）
+  visual_wake: 0.6  # 视觉唤醒后的低阈值
   change_timeout_ms: 100  # 阈值修改指令超时（毫秒）
 
 # 持续对话配置
 conversation:
-  vad_silence_timeout_default_sec: 8.0  # 默认免唤醒窗口（秒）
+  vad_silence_timeout_default_sec: 3.0  # 默认免唤醒窗口（秒）- 宏观发呆超时：唤醒后3秒内无语音则退回IDLE
   vad_silence_timeout_extended_sec: 15.0  # 未来用于疑问句延长的窗口（秒）
   vad_check_interval_ms: 200  # VAD检查间隔（毫秒）
   vad_rms_threshold: 0.003  # VAD RMS阈值（已废弃，由Silero VAD替代）
@@ -118,6 +118,7 @@ tts:
   enabled: true
   engine: "qwen3-tts"  # TTS引擎：从 "cosyvoice" 改为 "qwen3-tts"
   model_name: "Qwen3-TTS-12Hz-0.6B-Base"
+  model_path: "D:/AI_Cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"  # TTS模型路径（本地路径，优先使用，避免联网下载）
   ref_audio_path: "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需，几秒钟即可）
   sample_rate: 24000  # 采样率（Qwen3-TTS输出为24000Hz）
   speed: 1.0  # 默认语速

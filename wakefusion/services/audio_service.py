@@ -96,6 +96,12 @@ def control_listener_zmq():
                 # 重置缓冲区，防止混入旧声音
                 audio_buffer.fill(0.0)
                 write_pos = 0
+                zmq_rep_socket.send_json({"status": "ok"})
+            elif command == "stop_streaming":
+                # 🌟 修复：停止音频推流（进入PROCESSING状态时）
+                is_streaming = False
+                print("🛑 收到停止推流指令，退出流模式")
+                zmq_rep_socket.send_json({"status": "ok"})
                 if vad_engine is not None:
                     vad_engine.reset_states()  # 重置VAD，防止状态残留
                 print("✅ 收到中枢指令：进入免唤醒持续拾音模式")
@@ -114,20 +120,34 @@ def control_listener_zmq():
 
 def network_sender():
     """ZMQ PUB数据发送线程：使用Silero VAD + Multipart Message发送音频数据"""
-    global vad_engine
+    global vad_engine, is_streaming
+    # RMS 物理能量门限（Volume Gate）- 强杀底噪
+    
     while True:
         try:
             chunk = stream_queue.get()
             chunk_int16 = (chunk * 32767).astype(np.int16)
             
-            # 使用 Silero VAD 进行智能检测（替代RMS阈值）
-            # 调用VAD引擎接口，完全解耦
-            if vad_engine is not None:
-                vad_active = vad_engine.is_speech(chunk_int16)
+            # --- 核心修复：RMS 物理能量门限 ---
+            rms_energy = np.sqrt(np.mean(chunk_int16.astype(np.float32)**2))
+            
+            # 自动打印环境底噪（每 1 秒打印一次，不刷屏）
+            log_counter = getattr(network_sender, "log_counter", 0) + 1
+            if log_counter % 5 == 0 and not is_streaming:
+                print(f"🎙️ [校准用] 当前环境底噪 RMS: {rms_energy:.1f}      ", end='\r')
+            network_sender.log_counter = log_counter
+            
+            # 🌟 修复：提高默认阈值到 1500，强行压制 XVF3800 的 AGC 增益
+            RMS_THRESHOLD = 1500.0  
+            
+            if rms_energy < RMS_THRESHOLD:
+                vad_active = False
             else:
-                # 降级方案：如果VAD引擎未初始化，使用RMS阈值（向后兼容）
-                rms = np.sqrt(np.mean(chunk**2))
-                vad_active = rms >= VAD_RMS_THRESHOLD
+                if vad_engine is not None:
+                    vad_active = vad_engine.is_speech(chunk_int16)
+                else:
+                    vad_active = True
+            # ---------------------------------
             
             # 第一帧：JSON元数据
             metadata = {

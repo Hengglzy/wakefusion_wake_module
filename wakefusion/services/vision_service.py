@@ -25,6 +25,7 @@ from typing import Optional, List, Dict, Any
 from collections import deque
 import zmq
 from wakefusion.config import get_config
+from wakefusion.workers.lip_sync_detector import LipSyncDetector
 
 # 日志级别设置（MediaPipe 设为 WARNING）
 logging.getLogger("mediapipe").setLevel(logging.WARNING)
@@ -98,6 +99,7 @@ class VisionService:
         self._leave_frame_count: int = 0
         
         # 保留图像发送功能（UDP图像端口可保留，或后续讨论）
+        self.udp_host = "127.0.0.1"  # UDP 目标地址（GUI 接收地址）
         self.udp_image_port = 10000
         self.udp_depth_port = 10001
         self.udp_image_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -191,6 +193,9 @@ class VisionService:
         self._last_tracks_ts: float = time.time()
         # 最近一帧的人脸检测结果（用于跳帧时复用）
         self._last_faces: List[Dict[str, Any]] = []
+        
+        # 初始化唇动检测器
+        self.lip_detector = LipSyncDetector()
         
         vision_logger.info(
             f"VisionService initialized: ZMQ PUB tcp://127.0.0.1:{vision_pub_port}, "
@@ -697,6 +702,9 @@ class VisionService:
         rgb_image = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB) if rgb_frame.shape[2] == 3 else rgb_frame
         now_ts = time.time()
         
+        # 唇动检测（判断是否在说话）
+        is_talking = self.lip_detector.process_frame(rgb_image)
+        
         # 人脸检测
         face_results = self.face_detector.process(rgb_image)
         faces: List[Dict[str, Any]] = []
@@ -759,9 +767,11 @@ class VisionService:
         self._last_faces = faces
 
         # 手部检测（MediaPipe Tasks GestureRecognizer，LIVE_STREAM 异步）
-        # 如果 recognizer 尚未初始化成功，安全降级为“仅人脸检测”，hands 为空
+        # 如果 recognizer 尚未初始化成功，安全降级为"仅人脸检测"，hands 为空
         if self.recognizer is None:
-            return self._build_result_from_tracks(faces)
+            result = self._build_result_from_tracks(faces)
+            result["is_talking"] = is_talking
+            return result
 
         # 1) 推送当前帧到 recognizer（异步回调更新 self._latest_gesture_data）
         try:
@@ -771,7 +781,9 @@ class VisionService:
             self.recognizer.recognize_async(mp_image, ts_ms)
         except Exception:
             # 异步推理失败不影响主循环（本帧仅输出 faces）
-            return self._build_result_from_tracks(faces)
+            result = self._build_result_from_tracks(faces)
+            result["is_talking"] = is_talking
+            return result
 
         # 2) 从异步缓存读取最近一次结果（可能滞后一帧；若尚未返回则为空列表）
         with self._gesture_lock:
@@ -808,6 +820,8 @@ class VisionService:
 
         # 构建结果（距离字段由 run() 基于 Depth 补全）
         result = self._build_result_from_tracks(faces)
+        # 添加唇动检测结果
+        result["is_talking"] = is_talking
         return result
     
     def _update_visual_wake_state(self, faces: List[Dict[str, Any]]):
@@ -871,11 +885,20 @@ class VisionService:
             result: 检测结果字典
         """
         try:
+            is_talking = result.get("is_talking", False)
+            # 🌟 调试：记录 is_talking 状态变化（仅在状态改变时打印）
+            if not hasattr(self, '_last_sent_is_talking'):
+                self._last_sent_is_talking = None
+            if self._last_sent_is_talking != is_talking:
+                vision_logger.info(f"👄 [VisionService] 发送 is_talking 状态: {self._last_sent_is_talking} → {is_talking}")
+                self._last_sent_is_talking = is_talking
+            
             # 添加wake字段和timestamp
             zmq_data = {
                 "wake": self._visual_wake_state,
                 "faces": result.get("faces", []),
                 "hands": result.get("hands", []),
+                "is_talking": is_talking,
                 "timestamp": time.time()
             }
             # 通过ZMQ PUB发送
@@ -1050,6 +1073,10 @@ class VisionService:
                         result["distance_m"] = self._last_result.get("distance_m")
                         result["presence"] = self._last_result.get("presence", False)
                         result["confidence"] = self._last_result.get("confidence", 0.0)
+                        
+                        # 🌟 修复：必须继承唇动状态，防止跳帧导致状态在 True 和 False 之间疯狂闪烁
+                        result["is_talking"] = self._last_result.get("is_talking", False)
+                        
                         self._last_result = result
                     else:
                         result = self.process_frame(bgr)
@@ -1140,6 +1167,11 @@ class VisionService:
                     self.recognizer.close()
                 except Exception as e:
                     print(f"[WARNING] 关闭 GestureRecognizer 时出错: {e}")
+            if self.lip_detector is not None:
+                try:
+                    self.lip_detector.close()
+                except Exception as e:
+                    print(f"[WARNING] 关闭 LipSyncDetector 时出错: {e}")
             print("VisionService cleaned up")
 
 
