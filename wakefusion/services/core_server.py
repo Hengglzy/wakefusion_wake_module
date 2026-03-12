@@ -634,11 +634,12 @@ class CoreServer:
             return False
     
     def _send_stop_streaming_command(self):
-        """向音频模块发送停止推流指令（进入PROCESSING状态时停止音频推流）"""
+        """向音频模块发送停止推流指令（进入PROCESSING等状态时停止音频推流）"""
         try:
-            self.audio_req_socket.send_json({"command": "stop_streaming"}, zmq.NOBLOCK)
+            # 🌟 修复：移除 zmq.NOBLOCK，因为 REQ 必须确保命令可靠发出去
+            self.audio_req_socket.send_json({"command": "stop_streaming"})
             try:
-                reply = self.audio_req_socket.recv_json(zmq.NOBLOCK)
+                reply = self.audio_req_socket.recv_json()
                 if reply.get("status") == "ok":
                     logger.info("✅ 已通知音频底层停止推流")
                     return True
@@ -646,12 +647,8 @@ class CoreServer:
                     logger.warning(f"⚠️ 音频推流停止失败: {reply}")
                     return False
             except zmq.Again:
-                # 非阻塞接收，如果没有回复也不影响
-                logger.debug("音频推流停止命令已发送（无回复）")
+                logger.debug("音频推流停止命令已发送（无回复或超时）")
                 return True
-        except zmq.Again:
-            logger.warning("⚠️ 音频推流停止命令发送失败（缓冲区满）")
-            return False
         except Exception as e:
             logger.error(f"❌ 音频推流停止异常: {e}")
             return False
@@ -705,12 +702,31 @@ class CoreServer:
     def _transition_to_visual_wake(self, use_abort: bool = False):
         """转换到VISUAL_WAKE状态"""
         logger.info("状态转换: -> VISUAL_WAKE")
+        prev_state = self.current_state
+        
+        # 停止PROCESSING超时检查器
+        self._processing_timeout_should_exit = True
+        
+        # 🌟 核心修复1：从其他状态回到VISUAL_WAKE时，必须强行停止底层的免唤醒推流！
+        # 否则底层以为还在免唤醒状态，拒绝检测唤醒词，导致系统彻底死锁变聋。
+        if prev_state in [SystemState.LISTENING, SystemState.PROCESSING]:
+            self._send_stop_streaming_command()
+            
         if use_abort:
             self._send_abort_marker()
         else:
             self._send_end_marker()
-        # 不恢复阈值（保持0.4）
+            
+        # 🌟 核心修复2：彻底重置对话轮次和上下文，防止带着上一轮的记忆发呆
+        self._conversation_round = 0
+        self._wake_path = "unknown"
+        self._current_trace_id = None
+        
+        # 不恢复阈值（保持0.4，因为人还在看屏幕）
         self.current_state = SystemState.VISUAL_WAKE
+        
+        # 上报设备状态
+        self._report_device_state("idle")
     
     def _transition_to_listening(self, wake_path: str = "unknown"):
         """转换到LISTENING状态"""
@@ -995,11 +1011,11 @@ class CoreServer:
         logger.info(f"✅ VAD静音超时已动态调整为: {timeout_sec}秒")
     
     def run(self):
-        """运行核心服务器主循环"""
+        """运行核心服务器主循环（带全局崩溃护盾）"""
         logger.info("🚀 Core Server started")
         
-        try:
-            while True:
+        while True:
+            try:
                 # 使用Poller同时监听视觉和音频数据
                 socks = dict(self.poller.poll(timeout=100))  # 100ms超时
                 
@@ -1007,7 +1023,6 @@ class CoreServer:
                 if self.vision_sub_socket in socks:
                     try:
                         vision_data = self.vision_sub_socket.recv_json(zmq.NOBLOCK)
-                        # 🌟 已实现唇动检测功能，不再输出详细日志（避免刷屏）
                         self._process_vision_data(vision_data)
                     except zmq.Again:
                         pass
@@ -1017,7 +1032,6 @@ class CoreServer:
                 # 处理音频数据
                 if self.audio_sub_socket in socks:
                     try:
-                        # 接收Multipart Message
                         metadata_json, audio_binary = self.audio_sub_socket.recv_multipart(zmq.NOBLOCK)
                         metadata = json.loads(metadata_json.decode('utf-8'))
                         self._process_audio_data(metadata, audio_binary)
@@ -1027,9 +1041,8 @@ class CoreServer:
                         logger.error(f"处理音频数据异常: {e}")
                 
                 # 处理TTS音频数据
-                if self._tts_pull_socket and self._tts_pull_socket in socks:
+                if getattr(self, '_tts_pull_socket', None) and self._tts_pull_socket in socks:
                     try:
-                        # 接收Multipart Message
                         metadata_json, audio_binary = self._tts_pull_socket.recv_multipart(zmq.NOBLOCK)
                         metadata = json.loads(metadata_json.decode('utf-8'))
                         
@@ -1043,7 +1056,7 @@ class CoreServer:
                         logger.error(f"处理TTS音频数据异常: {e}")
                 
                 # 处理控制指令（LLM下行控制）
-                if self._control_rep_socket and self._control_rep_socket in socks:
+                if getattr(self, '_control_rep_socket', None) and self._control_rep_socket in socks:
                     try:
                         request = self._control_rep_socket.recv_json(zmq.NOBLOCK)
                         response = self._handle_control_command(request)
@@ -1058,19 +1071,28 @@ class CoreServer:
                             pass
                 
                 # 检查视觉数据丢失
-                if time.time() - self._last_vision_timestamp > 3.0:
-                    if self._latest_vision_wake:
+                if time.time() - getattr(self, '_last_vision_timestamp', 0) > 3.0:
+                    if getattr(self, '_latest_vision_wake', False):
                         logger.warning("⚠️ 视觉数据丢失（>3秒），视为wake=false")
                         self._latest_vision_wake = False
+                        # 🌟 修复：如果是在 VISUAL_WAKE 状态下丢失视觉，必须退回 IDLE，否则状态机会卡死！
+                        if self.current_state == SystemState.VISUAL_WAKE:
+                            self._transition_to_idle()
                 
                 # 检查冷却期（忽略VAD和KWS事件）
                 if self._is_in_cooldown():
                     continue
-                
-        except KeyboardInterrupt:
-            logger.info("🛑 Core Server stopped by user")
-        finally:
-            self._cleanup()
+                    
+            except KeyboardInterrupt:
+                logger.info("🛑 Core Server stopped by user")
+                self._cleanup()
+                break  # 只有用户按 Ctrl+C 才真正退出程序
+            except Exception as e:
+                # 🌟 核心护盾：捕获所有未知异常，打印堆栈，但不退出 while True！
+                import traceback
+                logger.error(f"💥 主循环遭遇致命错误并已被拦截: {e}")
+                logger.error(traceback.format_exc())
+                time.sleep(1.0)  # 防止因为疯狂报错导致 CPU 100%
     
     def _process_vision_data(self, vision_data: dict):
         """处理视觉数据"""
