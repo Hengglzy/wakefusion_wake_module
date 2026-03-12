@@ -309,6 +309,11 @@ class LLMAgentConfig(BaseModel):
     use_ssl: bool = False  # 是否使用SSL（true for wss://, false for ws://）
     reconnect_interval_sec: float = 5.0  # 断线重连间隔（秒）
     ping_interval_sec: float = 30.0  # 保活ping间隔（秒）
+    
+    # 火山引擎API配置（可选，如果使用火山引擎LLM Agent）
+    volcano_api_url: Optional[str] = None  # 火山引擎API地址
+    volcano_api_key: Optional[str] = None  # 火山引擎API密钥
+    volcano_model: Optional[str] = None  # 火山引擎模型名称
 
 
 class WebSocketConfig(BaseModel):

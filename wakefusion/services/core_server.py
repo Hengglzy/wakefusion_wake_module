@@ -96,6 +96,9 @@ class CoreServer:
         # 硬件冷却期（硬打断后）
         self._cooldown_until: float = 0.0
         
+        # 🌟 新增：用于屏蔽麦克风瞬间开启时的物理电流声或尾音回声
+        self._ignore_audio_until: float = 0.0
+        
         # Poller用于同时监听多个socket
         self.poller = zmq.Poller()
         self.poller.register(self.vision_sub_socket, zmq.POLLIN)
@@ -944,6 +947,11 @@ class CoreServer:
             self._conversation_round += 1
             logger.info(f"📊 对话轮次递增: {self._conversation_round}")
         
+        # 🌟 核心修复：开启 0.8 秒的绝对物理防抖时间！
+        # 屏蔽这段时间内的任何 VAD 波动和硬打断，防止自己录到自己的尾音
+        self._ignore_audio_until = time.time() + 0.8
+        logger.info(f"🛡️ 激活物理防抖护盾：0.8秒内忽略所有音频输入（直到 {self._ignore_audio_until:.2f}）")
+        
         # 转换到 LISTENING 状态（等待用户继续说话）
         self._transition_to_listening("持续对话")
     
@@ -1149,6 +1157,14 @@ class CoreServer:
     
     def _process_audio_data(self, metadata: dict, audio_binary: bytes):
         """处理音频数据"""
+        current_time = time.time()
+        
+        # 🛡️ 护盾拦截：如果在无敌时间内，直接丢弃 VAD 和 打断 信号！
+        if current_time < getattr(self, '_ignore_audio_until', 0.0):
+            # 忽略刚开麦时的物理噪音
+            logger.debug(f"🛡️ 物理防抖护盾生效中，忽略音频输入（剩余 {self._ignore_audio_until - current_time:.2f}秒）")
+            return
+        
         # 🌟 修复声学反馈问题：在SPEAKING状态下，忽略所有音频输入（除了唤醒词）
         # 防止TTS播放的音频被麦克风拾取后误识别为ASR输入
         if self.current_state == SystemState.SPEAKING:
@@ -1172,21 +1188,30 @@ class CoreServer:
         vad = metadata.get("vad", False)
         wake_word = metadata.get("wake_word", {})
         
-        # 更新VAD时间戳（展厅防抖机制）
-        if vad:
-            self._vad_speech_count += 1
-            self._vad_silence_count = 0
-            
-            # 必须连续2次（0.4秒）检测到人声，才认定为真语音，避免瞬间噪音（如咳嗽、碰撞）打断1.5秒计时
-            if self._vad_speech_count >= 2:
-                self._last_vad_time = time.time()
-                if not self._user_has_spoken:
-                    self._user_has_spoken = True
-                    logger.info("🗣️ 检测到用户真实开口，切换为1.5秒微观截断模式")
+        # 🌟 修复状态机漏风：只有在真正倾听时，才允许修改 _user_has_spoken！
+        # 防止 VISUAL_WAKE 状态下偷偷记录开口事件
+        if self.current_state == SystemState.LISTENING:
+            # 更新VAD时间戳（展厅防抖机制）
+            if vad:
+                self._vad_speech_count += 1
+                self._vad_silence_count = 0
+                
+                # 必须连续2次（0.4秒）检测到人声，才认定为真语音，避免瞬间噪音（如咳嗽、碰撞）打断1.5秒计时
+                if self._vad_speech_count >= 2:
+                    self._last_vad_time = current_time
+                    if not self._user_has_spoken:
+                        self._user_has_spoken = True
+                        logger.info("🗣️ 检测到用户真实开口，切换为1.5秒微观截断模式")
+            else:
+                self._vad_silence_count += 1
+                self._vad_speech_count = 0
+                # 真正的静音不需要操作，让 time_since_last_vad 自然累加即可触发超时
         else:
-            self._vad_silence_count += 1
-            self._vad_speech_count = 0
-            # 真正的静音不需要操作，让 time_since_last_vad 自然累加即可触发超时
+            # 🌟 修复：非 LISTENING 状态下，不更新 VAD 状态变量，防止状态泄漏
+            # 但需要重置计数器，避免状态残留
+            if not vad:
+                self._vad_silence_count += 1
+                self._vad_speech_count = 0
         
         # 处理唤醒词检测
         if wake_word.get("detected", False):
@@ -1209,7 +1234,8 @@ class CoreServer:
                 self._transition_to_listening("纯语音唤醒")
             
             # 路径C：唤醒词硬打断（在SPEAKING状态下）
-            # 🌟 修复：根据唤醒路径选择阈值
+            # 🌟 修复连环车祸：硬打断【只有】在数字人正在说话（SPEAKING）时才允许触发！
+            # 绝对不允许在 LISTENING 或 IDLE 时触发打断导致清空队列！
             elif self.current_state == SystemState.SPEAKING:
                 if self._wake_path == "visual":
                     threshold = self.audio_threshold_config.visual_wake
@@ -1219,6 +1245,7 @@ class CoreServer:
                 if confidence >= threshold:
                     logger.info(f"✅ [路径C] 唤醒词硬打断：置信度{confidence:.2%} >= 阈值{threshold}")
                     logger.info("🛑 听到唤醒词，触发硬打断！")
+                    self._handle_hard_cutoff()
                     self._transition_to_listening("唤醒词打断")
             
             # 🌟 修复：路径D：在PROCESSING状态下检测到唤醒词，立即进入LISTENING（持续对话）

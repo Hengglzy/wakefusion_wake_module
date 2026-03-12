@@ -46,6 +46,11 @@ class TTSModule:
         # 标点符号切分正则（支持中英文多种标点）
         self.punctuation_pattern = re.compile(self.tts_config.punctuation_pattern)
         
+        # 🌟 首句极速模式：首句用逗号切分，后续用句号切分
+        self._first_sentence_pattern = re.compile(r'[，,]+')  # 首句切分：逗号
+        self._subsequent_sentence_pattern = re.compile(r'[。！？.!?]+')  # 后续切分：句号、问号、感叹号
+        self._has_sent_first_sentence = False  # 是否已发送第一句
+        
         # 记录是否正在合成
         self._is_synthesizing = False
         self._synthesis_thread: Optional[threading.Thread] = None
@@ -223,6 +228,7 @@ class TTSModule:
                         logger.warning("收到停止信号，设置停止标志位，并清空合成队列")
                         self._stop_event.set()  # 设置全局停止标志
                         self.char_buffer = ""
+                        self._has_sent_first_sentence = False  # 重置首句标志
                         # 清空合成队列
                         while not self.synthesis_queue.empty():
                             try:
@@ -280,45 +286,81 @@ class TTSModule:
     
     def process_streaming_text(self, text_chunk: str, is_final: bool = False):
         """
-        处理流式文本，标点切分并放入合成队列
-        
-        Args:
-            text_chunk: 文本块
-            is_final: 是否为最后一块文本
+        处理流式文本，智能标点切分并放入合成队列（动态滑窗优化版）
         """
         self.char_buffer += text_chunk
         
-        # 动态标点切分策略：首句秒发
-        # Qwen3-TTS 具有极速首包响应能力，我们利用它通过尽早发送第一句话来降低TTFA
-        if self.char_buffer:
-            # 查找所有标点符号作为切分点
-            split_points = list(self.punctuation_pattern.finditer(self.char_buffer))
-            
-            if split_points:
-                # 找到最后一个标点符号，将标点及之前的内容作为一个完整的句子放入队列
-                last_split_idx = split_points[-1].end()
-                sentence = self.char_buffer[:last_split_idx].strip()
-                self.char_buffer = self.char_buffer[last_split_idx:]
-                
-                if len(sentence) >= self.tts_config.min_sentence_length or len(sentence) > 0 and len(split_points) == 1:
-                    logger.debug(f"📝 标点切分，将文本放入合成队列: {sentence}")
-                    self.synthesis_queue.put_nowait((sentence, False))
-                else:
-                    self.char_buffer = sentence + self.char_buffer # 如果太短，放回去继续攒 （可选，目前直接发）
+        # 🌟 获取最小句子长度门限
+        min_len = getattr(self.tts_config, 'min_sentence_length', 8)
         
-        # 如果是最后一块文本，处理剩余的缓冲区内容
-        if is_final:
-            if self.char_buffer.strip():
-                logger.debug(f"📝 最终块，将剩余文本放入合成队列: {self.char_buffer}")
-                self.synthesis_queue.put_nowait((self.char_buffer.strip(), True))
-            self.char_buffer = ""
+        # 🌟 核心修复：使用 while 循环，因为一次推送可能包含多个符合条件的句子
+        while True:
+            # 强制切分门限，防止无限积攒
+            force_cut = len(self.char_buffer) > 40
             
-            # 放入结束标记指令，保证它在所有文本合成完之后执行
+            # 根据是否发送过首句，选择不同的标点正则
+            if not self._has_sent_first_sentence:
+                pattern = self._first_sentence_pattern  # 包含逗号，追求首句破冰
+            else:
+                pattern = self._subsequent_sentence_pattern  # 仅限大标点，追求语气连贯
+                
+            matches = list(pattern.finditer(self.char_buffer))
+            
+            chunk_to_synth = None
+            cut_idx = 0
+            
+            if matches:
+                # 🌟 核心修复：遍历所有标点，像滚雪球一样寻找第一个能让句子长度 >= min_len 的点！
+                for m in matches:
+                    candidate_idx = m.end()
+                    candidate_text = self.char_buffer[:candidate_idx]
+                    clean_text = candidate_text.strip(" 。，！？.,!?\n\r\t")
+                    
+                    if len(clean_text) >= min_len:
+                        chunk_to_synth = candidate_text
+                        cut_idx = candidate_idx
+                        break  # 找到了完美的切分点，跳出 for 循环
+                
+                # 如果所有标点后的长度都不够，但触发了强切防卡死，就在最后一个标点处切断
+                if not chunk_to_synth and force_cut:
+                    cut_idx = matches[-1].end()
+                    chunk_to_synth = self.char_buffer[:cut_idx]
+
+            # 兜底：全是文字没标点且过长，或收到最终结束标志
+            if not chunk_to_synth:
+                if force_cut or (is_final and self.char_buffer.strip()):
+                    chunk_to_synth = self.char_buffer
+                    cut_idx = len(self.char_buffer)
+
+            # 执行切分并推入后台异步合成队列
+            if chunk_to_synth:
+                # 再次确认是否有实质内容
+                clean_chunk = chunk_to_synth.strip(" 。，！？.,!?\n\r\t")
+                if clean_chunk:
+                    logger.info(f"🚀 [动态切分] 提取合成块: {chunk_to_synth.strip()} (内容长度: {len(clean_chunk)}字符)")
+                    self.synthesis_queue.put_nowait((chunk_to_synth.strip(), False))
+                    self._has_sent_first_sentence = True
+                
+                # 从缓冲区移除已处理部分，继续下一轮 while 检查
+                self.char_buffer = self.char_buffer[cut_idx:]
+            else:
+                # 长度不够且未触发强切，退出 while 循环，等待大模型吐出更多文本
+                break
+                
+        # 所有文本结算完毕，并且缓冲区彻底空了，发送整段结束标记
+        if is_final and not self.char_buffer.strip():
+            self._has_sent_first_sentence = False
+            self.char_buffer = "" 
             self.synthesis_queue.put_nowait(("END_OF_TTS_SESSION", True))
     
     def synthesize_with_cutoff(self, text: str):
         """
-        带熔断机制的合成方法
+        带熔断机制的合成方法（后台异步执行，不阻塞文本接收）
+        
+        🌟 核心优化：利用播放时间掩盖推理时间
+        - 第一句合成时，用户等待（但第一句通常很短，合成快）
+        - 第一句播放时（1-2秒），后台已经在合成第二句
+        - 第一句播放完，第二句音频已经准备好，实现无缝衔接
         
         Args:
             text: 要合成的文本
@@ -329,6 +371,9 @@ class TTSModule:
         self._stop_event.clear()  # 重置停止标志
         
         try:
+            # 🌟 记录合成开始时间（用于性能分析）
+            synthesis_start = time.time()
+            
             # generate_voice_clone 返回 (wavs, sr) 元组，不是生成器
             # wavs 是音频数组列表，sr 是采样率
             wavs, sr = self.tts.generate_voice_clone(
@@ -336,6 +381,10 @@ class TTSModule:
                 ref_audio=self.ref_audio_path,
                 x_vector_only_mode=True  # 声纹抽取模式，不需要ref_text
             )
+            
+            # 🌟 记录合成耗时
+            synthesis_time = time.time() - synthesis_start
+            logger.debug(f"⏱️ TTS合成耗时: {synthesis_time:.2f}s, 文本长度: {len(text)}字符, 文本: {text[:30]}...")
             
             # 检查停止标志（在合成完成后检查）
             if self._stop_event.is_set():
@@ -347,6 +396,7 @@ class TTSModule:
                 audio_chunk = wavs[0]
                 # 发送音频块到ZMQ
                 self._send_audio_chunk(audio_chunk)
+                logger.debug(f"✅ 音频已发送: {len(text)}字符 -> {len(audio_chunk)}采样点")
             else:
                 logger.warning(f"TTS合成结果为空: {text[:20]}...")
         
@@ -354,9 +404,10 @@ class TTSModule:
             logger.error(f"TTS合成失败: {e}")
         
         finally:
-            # 如果被中断，清空字符缓冲区
+            # 如果被中断，清空字符缓冲区和首句标志
             if self._stop_event.is_set():
                 self.char_buffer = ""
+                self._has_sent_first_sentence = False
     
     def _send_audio_chunk(self, audio_chunk):
         """
