@@ -96,7 +96,8 @@ def control_listener_zmq():
             elif command == "reset_cooldown":
                 # 重置冷却期，允许立即再次唤醒
                 cooldown_until = 0
-                is_streaming = False  # 确保退出流模式
+                # 🌟 核心修复：只有收到 stop_streaming 时才将 is_streaming = False
+                # 重置冷却期不应该影响推流状态
                 if vad_engine is not None:
                     vad_engine.reset_states()  # 重置VAD，防止状态残留
                 print("✅ 冷却期已重置，可以立即再次唤醒")
@@ -473,7 +474,7 @@ def main():
                         if consecutive_hits > 0:
                             print()  # 换行，避免覆盖"疑似唤醒"信息
                         consecutive_hits = 0
-                        print(f"听... (静音, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
+                        print(f"听... (未唤醒, 需唤醒词) [静音, 阈值={active_threshold:.2f}]        ", end='\r', flush=True)
                         continue
                 else:
                     # 降级方案：使用RMS阈值（向后兼容）
@@ -483,7 +484,7 @@ def main():
                         if consecutive_hits > 0:
                             print()  # 换行，避免覆盖"疑似唤醒"信息
                         consecutive_hits = 0
-                        print(f"听... (静音, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
+                        print(f"听... (未唤醒, 需唤醒词) [静音, 阈值={active_threshold:.2f}]        ", end='\r', flush=True)
                         continue
 
                 # 🌟 推理（NeMo 或 OWW，由 infer() 闭包统一处理）
@@ -558,14 +559,14 @@ def main():
                         cooldown_until = time.time() + COOLDOWN_SECONDS
                     else:
                         # 连续命中但未达到要求，显示疑似唤醒
-                        print(f"🔍 疑似唤醒... (连续{consecutive_hits}/{CONSECUTIVE_HITS_REQUIRED}, 置信度={conf:.2%}, 阈值={active_threshold:.2f})", end='\r', flush=True)
+                        print(f"🔍 疑似唤醒... (未唤醒, 需唤醒词) [连续{consecutive_hits}/{CONSECUTIVE_HITS_REQUIRED}, 置信度={conf:.2%}, 阈值={active_threshold:.2f}]", end='\r', flush=True)
                 else:
                     # 置信度低于阈值或不是唤醒词，重置计数并显示正常监听状态
                     if consecutive_hits > 0:
                         # 如果之前有连续命中，先换行再显示，避免覆盖
                         print()  # 换行，避免覆盖"疑似唤醒"信息
                     consecutive_hits = 0  # 一旦中断，重置计数
-                    print(f"听... ({label} {conf:.1%}, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
+                    print(f"听... (未唤醒, 需唤醒词) [{label} {conf:.1%}, 阈值={active_threshold:.2f}]        ", end='\r', flush=True)
 
         except KeyboardInterrupt:
             print("\n🛑 服务已关闭。")
