@@ -20,7 +20,7 @@ kws:
   device: "cpu"  # 推理设备: cpu 或 cuda
   keyword: "yes"  # 默认关键词（英文预训练模型）
   threshold: 0.5  # 检测阈值
-  cooldown_ms: 1200  # 冷却时长（毫秒）
+  cooldown_ms: 1500  # 冷却时长（毫秒），用于硬打断后的OWW屏蔽
 
 # VAD配置（更新为Silero VAD）
 vad:
@@ -72,65 +72,78 @@ zmq:
   # ASR/TTS模块端口
   asr_pull_port: 5558  # ASR模块PULL端口（Core Server PUSH音频到此端口）
   asr_result_push_port: 5562  # ASR模块PUSH端口（ASR推送识别结果给Core Server）
-  tts_text_pull_port: 5563  # TTS模块PULL端口（TTS接收Core Server的合成文本）
-  tts_push_port: 5559  # TTS模块PUSH端口（Core Server PULL从此端口接收音频）
-  tts_stop_pub_port: 5560  # TTS停止信号PUB端口（Core Server发布，TTS订阅）
+  tts_text_pull_port: 5563  # TTS模块PULL端口（TTS接收Core Server的合成文本，已废弃）
+  tts_push_port: 5559  # TTS模块PUSH端口（Core Server PULL从此端口接收音频，已废弃）
+  tts_stop_pub_port: 5560  # TTS停止信号PUB端口（Core Server发布，TTS订阅，已废弃）
   core_control_rep_port: 5561  # Core Server控制端口（REP，接收LLM指令）
+  vision_ctrl_pub_port: 5564  # 视觉控制PUB端口（Core Server发布控制消息给Vision Service）
 
 # 视觉唤醒配置
 vision_wake:
-  detection_distance_m: 3.0  # 3米内开始检测
-  frontal_percent_threshold: 75  # 正面率阈值（%）
-  distance_range: [0.1, 3.5]  # 有效距离区间（米）
-  leave_timeout_sec: 1.5  # 离开区间持续多久才判定结束（秒）
-  leave_check_frames: 20  # 连续N帧不在区间内才判定离开（约1.5秒@15fps）
-  visual_cutoff_enabled: true  # 启用视觉斩断机制（最高优先级打断）
+  detection_distance_m: 4.0  # 4米内开始检测
+  frontal_percent_threshold: 70  # 正面率阈值（%）
+  distance_range: [0.4, 4.5]  # 有效距离区间（米），用于视觉斩断判断
+  enter_debounce_ms: 200  # 进入防抖窗口（毫秒），要求极速响应
+  leave_debounce_ms: 1000  # 离开防抖窗口（毫秒），防止误判
 
 # 音频动态阈值配置
 audio_threshold:
-  default: 0.85  # 默认高阈值（无人时）
-  visual_wake: 0.6  # 视觉唤醒后的低阈值
+  default: 0.9  # 默认高阈值（无人时，纯语音唤醒模式）
+  visual_wake: 0.6  # 视觉唤醒后的低阈值（视觉降维打击模式）
   change_timeout_ms: 100  # 阈值修改指令超时（毫秒）
 
 # 持续对话配置
 conversation:
-  vad_silence_timeout_default_sec: 3.0  # 默认免唤醒窗口（秒）- 宏观发呆超时：唤醒后3秒内无语音则退回IDLE
-  vad_silence_timeout_extended_sec: 15.0  # 未来用于疑问句延长的窗口（秒）
+  vad_silence_timeout_default_sec: 5.0  # 宏观超时（秒）：纯语音唤醒模式下，5秒无语音则结束对话
+  vad_silence_timeout_visual_sec: 5.0  # 宏观超时（秒）：视觉降维打击模式下，5秒无语音且无唇动则结束对话
+  vad_fast_cutoff_sec: 1.5  # 双模态快刀超时（秒）：连续1.5秒无声音且无唇动则结束对话
   vad_check_interval_ms: 200  # VAD检查间隔（毫秒）
+  interactive_timeout_sec: 90.0  # 交互超时（秒）：90秒无交互则退出交互模式
   vad_rms_threshold: 0.003  # VAD RMS阈值（已废弃，由Silero VAD替代）
     # 注意：这是简单的RMS能量阈值，已废弃
     # 如果Silero VAD未启用，将使用此值作为降级方案
     # 如果环境噪音较大，可以适当提高此值（如0.005-0.01）
     # 如果环境很安静，可以降低此值（如0.001-0.002）
 
-# ASR配置
-asr:
-  enabled: true
-  engine: "funasr"  # ASR引擎
-  model_name: "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型名称（在线推理模型，完整repo ID）
-  model_path: "D:/AI_Cache/modelscope/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型路径（本地路径，避免联网下载）
-  sample_rate: 16000  # 采样率
-  chunk_size_ms: 100  # 流式识别块大小（毫秒）
-  enable_online_inference: true  # 启用在线推理（真正的流式识别）
-  enable_partial_results: true  # 启用中间结果推送（partial_text）
-  use_cache: true  # 启用cache机制（必须启用，否则流式识别会崩溃）
-  timeout_sec: 30  # 超时时间（秒）
+# ASR配置（已迁移到服务器端，配置已注释）
+# asr:
+#   enabled: true
+#   engine: "funasr"  # ASR引擎
+#   model_name: "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型名称（在线推理模型，完整repo ID）
+#   model_path: "D:/AI_Cache/modelscope/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"  # FunASR模型路径（本地路径，避免联网下载）
+#   sample_rate: 16000  # 采样率
+#   chunk_size_ms: 100  # 流式识别块大小（毫秒）
+#   enable_online_inference: true  # 启用在线推理（真正的流式识别）
+#   enable_partial_results: true  # 启用中间结果推送（partial_text）
+#   use_cache: true  # 启用cache机制（必须启用，否则流式识别会崩溃）
+#   timeout_sec: 30  # 超时时间（秒）
 
-# TTS配置（更新为Qwen3-TTS）
-tts:
-  enabled: true
-  engine: "qwen3-tts"  # TTS引擎：从 "cosyvoice" 改为 "qwen3-tts"
-  model_name: "Qwen3-TTS-12Hz-0.6B-Base"
-  model_path: "D:/AI_Cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"  # TTS模型路径（本地路径，优先使用，避免联网下载）
-  ref_audio_path: "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需，几秒钟即可）
-  sample_rate: 24000  # 采样率（Qwen3-TTS输出为24000Hz）
-  speed: 1.0  # 默认语速
-  chunk_size_ms: 20  # 音频块大小（毫秒）
-  enable_streaming: true  # 是否启用流式输出
-  punctuation_pattern: "[。！？.!?，,]"  # 标点切分正则表达式
-  min_sentence_length: 8  # 最小句子长度（字符数），核心：必须攒够8个字以上才允许切分，提供足够的"播放掩护时间"
-  warmup_text: "系统初始化"  # 冷启动预热文本
-  warmup_enabled: true  # 是否启用冷启动预热
+# TTS配置（已迁移到服务器端，配置已注释）
+# tts:
+#   enabled: true
+#   engine: "qwen3-tts"  # TTS引擎：从 "cosyvoice" 改为 "qwen3-tts"
+#   model_name: "Qwen3-TTS-12Hz-0.6B-Base"
+#   model_path: "D:/AI_Cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"  # TTS模型路径（本地路径，优先使用，避免联网下载）
+#   ref_audio_path: "D:/tools/cursor_project/wakefusion_wake_module/real_audio/recording_0001.wav"  # Voice Clone参考音频（必需，几秒钟即可）
+#   sample_rate: 24000  # 采样率（Qwen3-TTS输出为24000Hz）
+#   speed: 1.0  # 默认语速
+#   chunk_size_ms: 20  # 音频块大小（毫秒）
+#   enable_streaming: true  # 是否启用流式输出
+#   punctuation_pattern: "[。！？.!?，,]"  # 标点切分正则表达式
+#   min_sentence_length: 8  # 最小句子长度（字符数），核心：必须攒够8个字以上才允许切分，提供足够的"播放掩护时间"
+#   warmup_text: "系统初始化"  # 冷启动预热文本
+#   warmup_enabled: true  # 是否启用冷启动预热
+
+# 音频播放配置（从服务器端接收的音频流）
+audio_playback:
+  sample_rate: 16000  # 采样率（Hz），必须与服务器端TTS输出一致
+  # 重要提示：
+  # - 如果服务器端使用Qwen3-TTS，其默认输出为24000Hz，此处应设置为24000
+  # - 如果服务器端使用其他TTS引擎输出16000Hz，则设置为16000
+  # - 采样率不匹配会导致声音变慢/变快或音调异常
+  format: "pcm_int16"  # 音频格式（pcm_int16, pcm_float32等，便于未来扩展视频等）
+  channels: 1  # 声道数
+  prebuffer_ms: 100  # 预缓冲时长（毫秒），用于网络抖动抑制，建议100ms
 
 # LLM Agent 配置（统一WebSocket协议）
 llm_agent:
@@ -141,7 +154,7 @@ llm_agent:
   reconnect_interval_sec: 5.0  # 断线重连间隔（秒）
   ping_interval_sec: 30.0  # 保活ping间隔（秒）
   
-  # 火山引擎API配置（如果使用火山引擎LLM Agent）
+  # 火山引擎API配置（如果使用火山引擎LLM Agent，已废弃）
   volcano_api_url: "https://ark.cn-beijing.volces.com/api/v3/responses"  # 火山引擎API地址
   volcano_api_key: "13855083-26c0-423a-9720-f0d02f9e7668"  # 火山引擎API密钥（Bearer Token）
   volcano_model: "doubao-seed-2-0-mini-260215"  # 火山引擎模型名称

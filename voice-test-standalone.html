@@ -1,0 +1,993 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice Gateway Test Console</title>
+    <style>
+      :root {
+        --bg: #0f1417;
+        --panel: #161d21;
+        --accent: #f3c623;
+        --accent-2: #4fd1c5;
+        --text: #f5f2e8;
+        --muted: #9aa6a8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--text);
+        background: radial-gradient(circle at top, #1a2429, #0b0f12 70%);
+      }
+
+      code {
+        font-family: "IBM Plex Mono", "Consolas", monospace;
+      }
+
+      .grid {
+        display: grid;
+        gap: 20px;
+        padding: 24px;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      }
+
+      .hero {
+        grid-column: 1 / -1;
+        padding: 28px;
+        background: linear-gradient(135deg, #1f2a30, #0f1417);
+        border: 1px solid #273238;
+        border-radius: 16px;
+      }
+
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .hero h1 {
+        margin: 8px 0;
+        font-size: 36px;
+      }
+
+      .lead {
+        max-width: 840px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .pill-row {
+        display: flex;
+        gap: 10px;
+        margin-top: 16px;
+        flex-wrap: wrap;
+      }
+
+      .pill {
+        background: #222d33;
+        color: var(--accent);
+        padding: 6px 12px;
+        border-radius: 999px;
+        font-size: 12px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid #232d33;
+        border-radius: 16px;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .wide {
+        grid-column: 1 / -1;
+      }
+
+      .panel h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .label {
+        min-width: 120px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .hint {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      input,
+      select,
+      textarea {
+        flex: 1;
+        background: #0f1417;
+        color: var(--text);
+        border: 1px solid #2b353b;
+        border-radius: 10px;
+        padding: 10px 12px;
+      }
+
+      .btn {
+        background: var(--accent);
+        color: #0c0f12;
+        border: none;
+        border-radius: 10px;
+        padding: 10px 16px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+
+      .btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 36px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid transparent;
+      }
+
+      .status-idle {
+        background: #1c262b;
+        color: var(--muted);
+        border-color: #324047;
+      }
+
+      .status-connecting {
+        background: #2d2411;
+        color: var(--accent);
+        border-color: #5a4310;
+      }
+
+      .status-closing {
+        background: #2a1f12;
+        color: #f2b66a;
+        border-color: #6a4b1c;
+      }
+
+      .status-connected {
+        background: #0f2a27;
+        color: var(--accent-2);
+        border-color: #1f5c55;
+      }
+
+      .status-closed,
+      .status-error {
+        background: #2a1717;
+        color: #ff9b8f;
+        border-color: #5b2f2a;
+      }
+
+      .output {
+        background: #0b0f12;
+        border: 1px dashed #2c353a;
+        border-radius: 10px;
+        padding: 12px;
+        min-height: 120px;
+        color: var(--accent-2);
+        overflow: auto;
+        white-space: pre-wrap;
+      }
+
+      .timeline {
+        background: #0b0f12;
+        border: 1px solid #2c353a;
+        border-radius: 12px;
+        min-height: 180px;
+        max-height: 320px;
+        overflow: auto;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .timeline-group {
+        border: 1px solid #273238;
+        border-radius: 12px;
+        background: #0f1519;
+        overflow: hidden;
+      }
+
+      .timeline-group[open] {
+        border-color: #35525b;
+      }
+
+      .timeline-group summary {
+        cursor: pointer;
+        list-style: none;
+        padding: 12px 14px;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        background: #121a1f;
+      }
+
+      .timeline-group summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .timeline-group-title {
+        color: var(--text);
+        font-weight: 600;
+      }
+
+      .timeline-group-meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .timeline-group-body {
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .timeline-item {
+        display: grid;
+        grid-template-columns: 88px 1fr;
+        gap: 12px;
+        align-items: start;
+        padding-bottom: 10px;
+        border-bottom: 1px dashed #273238;
+      }
+
+      .timeline-item:last-child {
+        border-bottom: none;
+        padding-bottom: 0;
+      }
+
+      .timeline-time {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .timeline-text {
+        color: var(--text);
+        line-height: 1.5;
+      }
+
+      .timeline-strong {
+        color: var(--accent-2);
+        font-weight: 600;
+      }
+
+      .details-box {
+        background: #10161a;
+        border: 1px solid #2c353a;
+        border-radius: 12px;
+        padding: 10px 12px;
+      }
+
+      .details-box summary {
+        cursor: pointer;
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      .detail-output {
+        min-height: 160px;
+        max-height: 320px;
+        margin-top: 10px;
+      }
+
+      @media (max-width: 900px) {
+        .row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .label {
+          min-width: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grid">
+      <section class="hero">
+        <p class="eyebrow">Industrial Assistant</p>
+        <h1>Voice Gateway Test Console</h1>
+        <p class="lead">
+          单文件版调试页。复制这一个文件到别的电脑也能直接打开。默认值对应本地联调启动命令：先执行
+          <code>npm run tts:cosyvoice</code>，再执行 <code>npm run dev:voice</code>。
+        </p>
+        <div class="pill-row">
+          <span class="pill">Health</span>
+          <span class="pill">SSE</span>
+          <span class="pill">Voice WS</span>
+          <span class="pill">Standalone HTML</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>基础配置</h2>
+        <div class="row">
+          <label class="label">HTTP Base</label>
+          <input id="base-url" type="text" value="http://127.0.0.1:7788" />
+        </div>
+        <div class="row">
+          <label class="label">WS Base</label>
+          <input id="ws-base-url" type="text" value="ws://127.0.0.1:7788" />
+        </div>
+        <div class="row">
+          <label class="label">Device ID</label>
+          <input id="device-id" type="text" value="dev-ui" />
+        </div>
+        <div class="row">
+          <label class="label">Token</label>
+          <input id="voice-token" type="text" value="test-voice-token" />
+        </div>
+        <p class="hint">默认 token 已对齐到 <code>npm run dev:voice</code> 的 <code>VOICE_SHARED_TOKEN=test-voice-token</code>。</p>
+      </section>
+
+      <section class="panel">
+        <h2>连接与健康</h2>
+        <div class="row">
+          <label class="label">WS 状态</label>
+          <span id="ws-status" class="status-badge status-idle">未连接</span>
+        </div>
+        <div class="row">
+          <button id="check-health" class="btn">检测 /api/health</button>
+          <button id="check-devices" class="btn">检测 /api/voice/devices</button>
+          <button id="connect-ws" class="btn">连接 Voice WS</button>
+          <button id="disconnect-ws" class="btn">断开 Voice WS</button>
+        </div>
+        <pre id="health-result" class="output"></pre>
+      </section>
+
+      <section class="panel wide">
+        <h2>SSE 接口测试</h2>
+        <div class="row">
+          <label class="label">消息</label>
+          <input id="sse-message" type="text" value="请用一句中文回复：在。" />
+        </div>
+        <div class="row">
+          <label class="label">模式</label>
+          <select id="sse-mode">
+            <option value="auto">auto</option>
+            <option value="fast-only">fast-only</option>
+            <option value="escalate-only">escalate-only</option>
+          </select>
+          <button id="run-sse" class="btn">调用 /api/assistant/stream</button>
+        </div>
+        <pre id="sse-result" class="output"></pre>
+      </section>
+
+      <section class="panel wide">
+        <h2>Voice WS 测试</h2>
+        <div class="row">
+          <label class="label">Trace ID</label>
+          <input id="voice-trace-id" type="text" value="trace-ui-1" />
+        </div>
+        <div class="row">
+          <label class="label">Partial</label>
+          <input id="voice-partial" type="text" value="你好" />
+          <button id="send-partial" class="btn">发 partial</button>
+        </div>
+        <div class="row">
+          <label class="label">Final</label>
+          <input id="voice-final" type="text" value="请用一句中文回复：收到。" />
+          <button id="send-final" class="btn">发 final</button>
+          <button id="send-interrupt" class="btn">发 interrupt</button>
+        </div>
+        <div class="row">
+          <label class="label">过程面板</label>
+          <button id="clear-process" class="btn">清除过程</button>
+          <button id="clear-detail" class="btn">清除详细日志</button>
+        </div>
+        <div id="process-board" class="timeline"></div>
+        <details class="details-box">
+          <summary>查看详细日志（最近 100 条）</summary>
+          <pre id="detail-log" class="output detail-output"></pre>
+        </details>
+        <pre id="ws-result" class="output"></pre>
+      </section>
+    </div>
+
+    <script>
+      const baseUrlInput = document.getElementById("base-url");
+      const wsBaseUrlInput = document.getElementById("ws-base-url");
+      const deviceIdInput = document.getElementById("device-id");
+      const voiceTokenInput = document.getElementById("voice-token");
+      const healthResult = document.getElementById("health-result");
+      const sseResult = document.getElementById("sse-result");
+      const wsResult = document.getElementById("ws-result");
+      const wsStatus = document.getElementById("ws-status");
+      const processBoard = document.getElementById("process-board");
+      const detailLog = document.getElementById("detail-log");
+      const sseMessageInput = document.getElementById("sse-message");
+      const sseModeSelect = document.getElementById("sse-mode");
+      const traceIdInput = document.getElementById("voice-trace-id");
+      const partialInput = document.getElementById("voice-partial");
+      const finalInput = document.getElementById("voice-final");
+      const checkHealthBtn = document.getElementById("check-health");
+      const checkDevicesBtn = document.getElementById("check-devices");
+      const runSseBtn = document.getElementById("run-sse");
+      const connectWsBtn = document.getElementById("connect-ws");
+      const disconnectWsBtn = document.getElementById("disconnect-ws");
+      const sendPartialBtn = document.getElementById("send-partial");
+      const sendFinalBtn = document.getElementById("send-final");
+      const sendInterruptBtn = document.getElementById("send-interrupt");
+      const clearProcessBtn = document.getElementById("clear-process");
+      const clearDetailBtn = document.getElementById("clear-detail");
+
+      let voiceSocket = null;
+      let wsPhase = "idle";
+      let detailLines = [];
+      let activeRuns = new Map();
+      let processEntries = [];
+      let audioQueue = [];
+      let audioPlaying = false;
+      let currentAudio = null;
+
+      applyRuntimeDefaults();
+      updateWsUi();
+
+      checkHealthBtn.addEventListener("click", async () => {
+        healthResult.textContent = "loading...";
+        try {
+          const payload = await fetchJson(`${baseUrl()}/api/health`);
+          healthResult.textContent = JSON.stringify(payload, null, 2);
+        } catch (err) {
+          healthResult.textContent = String(err);
+        }
+      });
+
+      checkDevicesBtn.addEventListener("click", async () => {
+        healthResult.textContent = "loading...";
+        try {
+          const payload = await fetchJson(`${baseUrl()}/api/voice/devices`);
+          healthResult.textContent = JSON.stringify(payload, null, 2);
+        } catch (err) {
+          healthResult.textContent = String(err);
+        }
+      });
+
+      runSseBtn.addEventListener("click", async () => {
+        sseResult.textContent = "";
+        try {
+          const res = await fetch(`${baseUrl()}/api/assistant/stream`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              message: sseMessageInput.value.trim(),
+              userId: `device:${deviceIdInput.value.trim()}`,
+              sessionKey: `voice:${deviceIdInput.value.trim()}`,
+              options: {
+                preferredMode: sseModeSelect.value,
+                stream: true,
+              },
+            }),
+          });
+          if (!res.ok || !res.body) {
+            sseResult.textContent = await res.text();
+            return;
+          }
+          for await (const event of readSse(res.body)) {
+            sseResult.textContent += `${event.raw}\n`;
+          }
+        } catch (err) {
+          sseResult.textContent = String(err);
+        }
+      });
+
+      connectWsBtn.addEventListener("click", () => {
+        connectVoiceWs();
+      });
+
+      disconnectWsBtn.addEventListener("click", () => {
+        if (voiceSocket) {
+          appendWs("[client] closing ws");
+          setWsPhase("closing", "断开中");
+          voiceSocket.close();
+        }
+      });
+
+      sendPartialBtn.addEventListener("click", () => {
+        sendVoice({
+          type: "asr",
+          stage: "partial",
+          text: partialInput.value.trim(),
+          traceId: traceIdInput.value.trim(),
+          deviceId: deviceIdInput.value.trim(),
+          timestamp: Date.now() / 1000,
+          confidence: 0.9,
+        });
+      });
+
+      sendFinalBtn.addEventListener("click", () => {
+        sendVoice({
+          type: "asr",
+          stage: "final",
+          text: finalInput.value.trim(),
+          traceId: traceIdInput.value.trim(),
+          deviceId: deviceIdInput.value.trim(),
+          timestamp: Date.now() / 1000,
+          confidence: 0.98,
+        });
+      });
+
+      sendInterruptBtn.addEventListener("click", () => {
+        sendVoice({
+          type: "interrupt",
+          traceId: traceIdInput.value.trim(),
+          deviceId: deviceIdInput.value.trim(),
+          reason: "ui-test",
+        });
+      });
+
+      clearProcessBtn.addEventListener("click", () => {
+        processEntries = [];
+        renderProcessBoard();
+        activeRuns = new Map();
+      });
+
+      clearDetailBtn.addEventListener("click", () => {
+        detailLines = [];
+        detailLog.textContent = "";
+        wsResult.textContent = "";
+      });
+
+      function connectVoiceWs() {
+        if (voiceSocket && (voiceSocket.readyState === WebSocket.OPEN || voiceSocket.readyState === WebSocket.CONNECTING)) {
+          appendWs("[client] ws already connected");
+          return;
+        }
+        const url = `${wsBaseUrl()}/api/voice/ws?deviceId=${encodeURIComponent(deviceIdInput.value.trim())}&token=${encodeURIComponent(voiceTokenInput.value.trim())}`;
+        appendWs(`[client] connecting ${url}`);
+        setWsPhase("connecting", "连接中");
+        voiceSocket = new WebSocket(url);
+        voiceSocket.addEventListener("open", () => {
+          setWsPhase("connected", "已连接");
+          appendWs("[client] ws connected");
+          pushProcess("system", "已连接到语音服务，可以开始发送文本。");
+        });
+        voiceSocket.addEventListener("close", (event) => {
+          appendWs(`[client] ws closed code=${event.code} reason=${event.reason || "-"}`);
+          voiceSocket = null;
+          setWsPhase("closed", "已断开");
+          pushProcess("system", `连接已断开（code=${event.code}）。`);
+        });
+        voiceSocket.addEventListener("error", () => {
+          appendWs("[client] ws error");
+          setWsPhase("error", "连接异常");
+          pushProcess("system", "连接出现异常。请先执行 npm run tts:cosyvoice 和 npm run dev:voice，再检查地址与 token 是否仍是默认值。");
+        });
+        voiceSocket.addEventListener("message", (event) => {
+          const raw = String(event.data);
+          appendWs(raw);
+          appendDetail(raw);
+          try {
+            const parsed = JSON.parse(raw);
+            handleVoiceEvent(parsed);
+          } catch {
+          }
+        });
+      }
+
+      function sendVoice(payload) {
+        if (!voiceSocket || voiceSocket.readyState !== WebSocket.OPEN) {
+          appendWs("[client] ws is not connected");
+          return;
+        }
+        const raw = JSON.stringify(payload);
+        appendWs(`[client->server] ${raw}`);
+        appendDetail(raw);
+        trackClientAction(payload);
+        voiceSocket.send(raw);
+      }
+
+      async function fetchJson(url) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`${res.status} ${await res.text()}`);
+        }
+        return await res.json();
+      }
+
+      async function* readSse(stream) {
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          while (true) {
+            const idx = buffer.indexOf("\n\n");
+            if (idx === -1) {
+              break;
+            }
+            const raw = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            yield { raw };
+          }
+        }
+      }
+
+      function appendWs(line) {
+        wsResult.textContent += `${line}\n`;
+        wsResult.scrollTop = wsResult.scrollHeight;
+      }
+
+      function appendDetail(line) {
+        detailLines.push(line);
+        if (detailLines.length > 100) {
+          detailLines = detailLines.slice(detailLines.length - 100);
+        }
+        detailLog.textContent = detailLines.join("\n");
+        detailLog.scrollTop = detailLog.scrollHeight;
+      }
+
+      function trackClientAction(payload) {
+        if (!payload || typeof payload !== "object") {
+          return;
+        }
+        if (payload.type === "asr" && payload.stage === "final") {
+          const traceId = String(payload.traceId || "");
+          if (!traceId) {
+            return;
+          }
+          activeRuns.set(traceId, {
+            startedAt: performance.now(),
+            firstTokenAt: null,
+            finishedAt: null,
+            route: "",
+            textLength: 0,
+          });
+          pushProcess(traceId, `你已发送问题，系统开始处理。内容：${payload.text || ""}`);
+          return;
+        }
+        if (payload.type === "asr" && payload.stage === "partial") {
+          pushProcess(String(payload.traceId || "system"), `设备上传了中间识别结果：${payload.text || ""}`);
+          return;
+        }
+        if (payload.type === "interrupt") {
+          pushProcess(String(payload.traceId || "system"), "你发出了打断指令，系统将停止当前播报。");
+        }
+      }
+
+      function handleVoiceEvent(event) {
+        const type = String(event.type || "");
+        const traceId = String(event.traceId || "system");
+        const run = activeRuns.get(traceId);
+
+        if (type === "meta") {
+          pushProcess(traceId, "服务端已收到请求，开始准备回答。");
+          return;
+        }
+        if (type === "route") {
+          if (run) {
+            run.route = String(event.route || "");
+          }
+          pushProcess(traceId, `系统选择了${friendlyRoute(event.route)}路径处理这次请求。`);
+          return;
+        }
+        if (type === "token") {
+          if (run) {
+            run.textLength += String(event.text || "").length;
+            if (!run.firstTokenAt) {
+              run.firstTokenAt = performance.now();
+              pushProcess(traceId, `收到第一段回复，用时 ${formatDuration(run.firstTokenAt - run.startedAt)}。`);
+            }
+          }
+          pushProcess(traceId, `正在返回内容：${String(event.text || "")}`);
+          return;
+        }
+        if (type === "audio_begin") {
+          pushProcess(traceId, "语音开始生成。");
+          return;
+        }
+        if (type === "audio_chunk") {
+          queueAudioChunk(event);
+          pushProcess(traceId, `收到第 ${String(event.seq || "?")} 段音频，准备播放。`);
+          return;
+        }
+        if (type === "audio_end") {
+          pushProcess(traceId, "本轮语音数据已全部返回。");
+          return;
+        }
+        if (type === "audio_error") {
+          pushProcess(traceId, `语音生成失败：${String(event.message || "未知错误")}`, true);
+          return;
+        }
+        if (type === "warning") {
+          pushProcess(traceId, `系统给出提醒：${String(event.message || "")}`);
+          return;
+        }
+        if (type === "stop_tts") {
+          stopAudioPlayback();
+          pushProcess(traceId, "系统要求设备立即停止当前播报。");
+          return;
+        }
+        if (type === "final") {
+          if (run) {
+            run.finishedAt = performance.now();
+            const total = formatDuration(run.finishedAt - run.startedAt);
+            const first = run.firstTokenAt ? formatDuration(run.firstTokenAt - run.startedAt) : "未返回首段";
+            pushProcess(traceId, `本轮已完成。路径：${friendlyRoute(run.route || event.route)}，首段耗时：${first}，总耗时：${total}。`, true);
+            void appendLlmRequests(traceId);
+            activeRuns.delete(traceId);
+            return;
+          }
+          pushProcess(traceId, "本轮已完成。", true);
+          void appendLlmRequests(traceId);
+          return;
+        }
+        if (type === "error") {
+          if (run) {
+            const total = formatDuration(performance.now() - run.startedAt);
+            pushProcess(traceId, `本轮失败/中止：${String(event.message || event.code || "未知错误")}（耗时 ${total}）。`, true);
+            void appendLlmRequests(traceId);
+            activeRuns.delete(traceId);
+            return;
+          }
+          pushProcess(traceId, `收到错误：${String(event.message || event.code || "未知错误")}`, true);
+          void appendLlmRequests(traceId);
+        }
+      }
+
+      function pushProcess(traceId, message, strong = false) {
+        processEntries.push({
+          traceId,
+          message,
+          strong,
+          at: new Date(),
+        });
+        if (processEntries.length > 100) {
+          processEntries = processEntries.slice(processEntries.length - 100);
+        }
+        renderProcessBoard();
+      }
+
+      function friendlyRoute(route) {
+        if (route === "fast") {
+          return "快速";
+        }
+        if (route === "escalate") {
+          return "复杂";
+        }
+        return route || "未知";
+      }
+
+      function formatDuration(ms) {
+        if (!Number.isFinite(ms)) {
+          return "-";
+        }
+        if (ms < 1000) {
+          return `${Math.round(ms)}ms`;
+        }
+        return `${(ms / 1000).toFixed(2)}s`;
+      }
+
+      function formatClock(date) {
+        return date.toLocaleTimeString("zh-CN", { hour12: false });
+      }
+
+      function setWsPhase(phase, label) {
+        wsPhase = phase;
+        wsStatus.textContent = label;
+        wsStatus.className = `status-badge ${statusClass(phase)}`;
+        updateWsUi();
+      }
+
+      function statusClass(phase) {
+        switch (phase) {
+          case "connecting":
+            return "status-connecting";
+          case "closing":
+            return "status-closing";
+          case "connected":
+            return "status-connected";
+          case "closed":
+            return "status-closed";
+          case "error":
+            return "status-error";
+          default:
+            return "status-idle";
+        }
+      }
+
+      function updateWsUi() {
+        const isConnecting = wsPhase === "connecting";
+        const isClosing = wsPhase === "closing";
+        const isConnected = voiceSocket && voiceSocket.readyState === WebSocket.OPEN;
+        connectWsBtn.disabled = Boolean(isConnecting || isClosing || isConnected);
+        disconnectWsBtn.disabled = !voiceSocket || voiceSocket.readyState === WebSocket.CLOSED || isClosing;
+        sendPartialBtn.disabled = !isConnected;
+        sendFinalBtn.disabled = !isConnected;
+        sendInterruptBtn.disabled = !isConnected;
+      }
+
+      function renderProcessBoard() {
+        processBoard.innerHTML = "";
+        const groups = new Map();
+        for (const entry of processEntries) {
+          const key = entry.traceId || "system";
+          const bucket = groups.get(key) || [];
+          bucket.push(entry);
+          groups.set(key, bucket);
+        }
+
+        for (const [traceId, entries] of groups) {
+          const group = document.createElement("details");
+          group.className = "timeline-group";
+          group.open = traceId !== "system";
+
+          const summary = document.createElement("summary");
+          const title = document.createElement("div");
+          title.className = "timeline-group-title";
+          title.textContent = traceId === "system" ? "系统状态" : `请求 ${traceId}`;
+
+          const meta = document.createElement("div");
+          meta.className = "timeline-group-meta";
+          meta.textContent = `${entries.length} 条记录 · 最新 ${formatClock(entries[entries.length - 1].at)}`;
+
+          summary.appendChild(title);
+          summary.appendChild(meta);
+          group.appendChild(summary);
+
+          const body = document.createElement("div");
+          body.className = "timeline-group-body";
+          for (const entry of entries) {
+            const item = document.createElement("div");
+            item.className = "timeline-item";
+
+            const time = document.createElement("div");
+            time.className = "timeline-time";
+            time.textContent = formatClock(entry.at);
+
+            const text = document.createElement("div");
+            text.className = entry.strong ? "timeline-text timeline-strong" : "timeline-text";
+            text.textContent = entry.message;
+
+            item.appendChild(time);
+            item.appendChild(text);
+            body.appendChild(item);
+          }
+
+          group.appendChild(body);
+          processBoard.appendChild(group);
+        }
+
+        processBoard.scrollTop = processBoard.scrollHeight;
+      }
+
+      function queueAudioChunk(event) {
+        const mimeType = String(event.mimeType || "audio/wav");
+        const data = String(event.data || "");
+        if (!data) {
+          return;
+        }
+        const bytes = Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
+        const blob = new Blob([bytes], { type: mimeType });
+        audioQueue.push({
+          traceId: String(event.traceId || "system"),
+          url: URL.createObjectURL(blob),
+        });
+        void drainAudioQueue();
+      }
+
+      async function drainAudioQueue() {
+        if (audioPlaying) {
+          return;
+        }
+        audioPlaying = true;
+        try {
+          while (audioQueue.length > 0) {
+            const item = audioQueue.shift();
+            if (!item) {
+              continue;
+            }
+            pushProcess(item.traceId, "设备端开始播放这一段音频。");
+            await playAudio(item.url);
+            URL.revokeObjectURL(item.url);
+            pushProcess(item.traceId, "这一段音频播放结束。");
+          }
+        } finally {
+          audioPlaying = false;
+        }
+      }
+
+      function playAudio(url) {
+        return new Promise((resolve) => {
+          const audio = new Audio(url);
+          currentAudio = audio;
+          const finalize = () => {
+            if (currentAudio === audio) {
+              currentAudio = null;
+            }
+            resolve();
+          };
+          audio.addEventListener("ended", finalize, { once: true });
+          audio.addEventListener("error", finalize, { once: true });
+          audio.play().catch(() => finalize());
+        });
+      }
+
+      function stopAudioPlayback() {
+        audioQueue = [];
+        if (!currentAudio) {
+          return;
+        }
+        try {
+          currentAudio.pause();
+          currentAudio.currentTime = 0;
+        } catch {
+        }
+        currentAudio = null;
+      }
+
+      async function appendLlmRequests(traceId) {
+        if (!traceId || traceId === "system") {
+          return;
+        }
+        try {
+          const payload = await fetchJson(`${baseUrl()}/api/debug/llm-requests?traceId=${encodeURIComponent(traceId)}&limit=20`);
+          const records = Array.isArray(payload.records) ? payload.records : [];
+          if (!records.length) {
+            appendDetail(`[llm-request][${traceId}] no records`);
+            return;
+          }
+          for (const record of records) {
+            appendDetail(`[llm-request][${traceId}] ${JSON.stringify(record, null, 2)}`);
+          }
+        } catch (err) {
+          appendDetail(`[llm-request][${traceId}] fetch failed: ${String(err)}`);
+        }
+      }
+
+      function baseUrl() {
+        return baseUrlInput.value.trim().replace(/\/$/, "");
+      }
+
+      function wsBaseUrl() {
+        return wsBaseUrlInput.value.trim().replace(/\/$/, "");
+      }
+
+      function applyRuntimeDefaults() {
+        if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+          const origin = window.location.origin.replace(/\/$/, "");
+          const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+          const wsOrigin = `${wsProtocol}//${window.location.host}`;
+          if (!baseUrlInput.value.trim() || baseUrlInput.value.includes("127.0.0.1")) {
+            baseUrlInput.value = origin;
+          }
+          if (!wsBaseUrlInput.value.trim() || wsBaseUrlInput.value.includes("127.0.0.1")) {
+            wsBaseUrlInput.value = wsOrigin;
+          }
+        }
+      }
+    </script>
+  </body>
+</html>

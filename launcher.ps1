@@ -59,27 +59,17 @@ if ($choice -eq "1") {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     
-    Write-Host "[1/5] Starting Vision Service (env: wakefusion_vision)..." -ForegroundColor Green
+    Write-Host "[1/3] Starting Vision Service (env: wakefusion_vision)..." -ForegroundColor Green
     $visionCmd = "${condaInit}conda activate wakefusion_vision; python -m wakefusion.services.vision_service --fps 15"
     Start-Process powershell -ArgumentList "-NoExit", "-Command", $visionCmd -WindowStyle Normal
     Start-Sleep -Seconds 3
     
-    Write-Host "[2/5] Starting Audio Service (env: wakefusion)..." -ForegroundColor Green
+    Write-Host "[2/3] Starting Audio Service (env: wakefusion)..." -ForegroundColor Green
     $audioCmd = "${condaInit}conda activate wakefusion; python -m wakefusion.services.audio_service"
     Start-Process powershell -ArgumentList "-NoExit", "-Command", $audioCmd -WindowStyle Normal
     Start-Sleep -Seconds 3
     
-    Write-Host "[3/5] Starting ASR Service (env: wakefusion_cosyvoice)..." -ForegroundColor Green
-    $asrCmd = "${condaInit}conda activate wakefusion_cosyvoice; python -m wakefusion.services.asr_service"
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", $asrCmd -WindowStyle Normal
-    Start-Sleep -Seconds 3
-    
-    Write-Host "[4/5] Starting TTS Service (env: wakefusion_cosyvoice)..." -ForegroundColor Green
-    $ttsCmd = "${condaInit}conda activate wakefusion_cosyvoice; python -m wakefusion.services.tts_service"
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", $ttsCmd -WindowStyle Normal
-    Start-Sleep -Seconds 3
-    
-    Write-Host "[5/5] Starting Core Server (env: wakefusion)..." -ForegroundColor Green
+    Write-Host "[3/3] Starting Core Server (env: wakefusion)..." -ForegroundColor Green
     $coreCmd = "${condaInit}conda activate wakefusion; python -m wakefusion.services.core_server"
     Start-Process powershell -ArgumentList "-NoExit", "-Command", $coreCmd -WindowStyle Normal
     Start-Sleep -Seconds 2
@@ -92,9 +82,7 @@ if ($choice -eq "1") {
     Write-Host "Service List:" -ForegroundColor Yellow
     Write-Host "  - Vision Service (ZMQ Port: 5555)"
     Write-Host "  - Audio Service (ZMQ Port: 5556, 5557)"
-    Write-Host "  - ASR Service  (ZMQ Port: 5558, 5562)"
-    Write-Host "  - TTS Service  (ZMQ Port: 5559, 5563)"
-    Write-Host "  - Core Server  (ZMQ Port: 5561, WebSocket Client → LLM Agent: 8080)"
+    Write-Host "  - Core Server  (ZMQ Port: 5561, 5564, WebSocket Client → LLM Agent: 8080)"
     Write-Host ""
     Write-Host "Usage Tips:" -ForegroundColor Yellow
     Write-Host "  - Each service runs in a separate window"
@@ -103,8 +91,10 @@ if ($choice -eq "1") {
     Write-Host "  - Run this script again and select option 2 to stop all services"
     Write-Host ""
     Write-Host "Note:" -ForegroundColor Yellow
+    Write-Host "  - ASR and TTS have been migrated to the server side (LLM Agent)"
     Write-Host "  - Core Server will connect to LLM Agent via WebSocket (default: ws://127.0.0.1:8080)"
     Write-Host "  - Make sure LLM Agent is running before starting Core Server"
+    Write-Host "  - For testing, you can use: python tests/mock_llm_agent_simple.py"
     Write-Host ""
     
 } elseif ($choice -eq "2") {
@@ -127,11 +117,9 @@ if ($choice -eq "1") {
     foreach ($proc in $processes) {
         try {
             $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)").CommandLine
-            if ($cmdline -match "wakefusion\.services\.(vision_service|audio_service|asr_service|tts_service|core_server)") {
+            if ($cmdline -match "wakefusion\.services\.(vision_service|audio_service|core_server)") {
                 $serviceName = if ($cmdline -match "vision_service") { "Vision Service" }
                               elseif ($cmdline -match "audio_service") { "Audio Service" }
-                              elseif ($cmdline -match "asr_service") { "ASR Service" }
-                              elseif ($cmdline -match "tts_service") { "TTS Service" }
                               elseif ($cmdline -match "core_server") { "Core Server" }
                               else { "Unknown Service" }
                 

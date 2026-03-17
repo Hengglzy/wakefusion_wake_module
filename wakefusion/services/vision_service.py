@@ -94,9 +94,19 @@ class VisionService:
         self._zmq_pub_socket.bind(f"tcp://127.0.0.1:{vision_pub_port}")
         vision_logger.info(f"ZMQ PUB Socket bound to tcp://127.0.0.1:{vision_pub_port}")
         
-        # 视觉唤醒状态机
-        self._visual_wake_state: bool = False
-        self._leave_frame_count: int = 0
+        # 初始化 ZMQ SUB Socket（接收Core Server的控制消息）
+        self._vision_ctrl_sub_socket = self.zmq_context.socket(zmq.SUB)
+        vision_ctrl_pub_port = self.zmq_config.vision_ctrl_pub_port
+        self._vision_ctrl_sub_socket.connect(f"tcp://127.0.0.1:{vision_ctrl_pub_port}")
+        self._vision_ctrl_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # 订阅所有消息
+        vision_logger.info(f"ZMQ SUB Socket connected to tcp://127.0.0.1:{vision_ctrl_pub_port}")
+        
+        # 启动控制消息接收线程
+        self._ctrl_thread_stop = threading.Event()
+        self._ctrl_thread = threading.Thread(target=self._control_message_loop, daemon=True)
+        self._ctrl_thread.start()
+        
+        # 视觉唤醒状态机已移除，业务逻辑移至core_server
         
         # 保留图像发送功能（UDP图像端口可保留，或后续讨论）
         self.udp_host = "127.0.0.1"  # UDP 目标地址（GUI 接收地址）
@@ -193,6 +203,8 @@ class VisionService:
         self._last_tracks_ts: float = time.time()
         # 最近一帧的人脸检测结果（用于跳帧时复用）
         self._last_faces: List[Dict[str, Any]] = []
+        # 🌟 任务3：EMA滤波存储 - 存储每个face的上一帧frontal_percent（key: face_id）
+        self._face_frontal_history: Dict[int, float] = {}
         
         # 初始化唇动检测器
         self.lip_detector = LipSyncDetector()
@@ -258,6 +270,39 @@ class VisionService:
                 # 发送缓冲满或临时错误：丢包即可（实时视频允许）
                 break
 
+    def _control_message_loop(self):
+        """控制消息接收循环（接收Core Server的控制消息）"""
+        vision_logger.info("控制消息接收线程已启动")
+        while not self._ctrl_thread_stop.is_set():
+            try:
+                # 使用非阻塞接收，带超时
+                try:
+                    message = self._vision_ctrl_sub_socket.recv_json(zmq.NOBLOCK)
+                    event = message.get("event")
+                    
+                    if event == "START_LIP_SYNC":
+                        vision_logger.info("🎬 收到START_LIP_SYNC，启动口型同步")
+                        # 通知lip_detector开始检测
+                        if self.lip_detector:
+                            self.lip_detector.start_sync()
+                    elif event == "STOP_LIP_SYNC":
+                        vision_logger.info("🛑 收到STOP_LIP_SYNC，停止口型同步")
+                        # 通知lip_detector停止检测
+                        if self.lip_detector:
+                            self.lip_detector.stop_sync()
+                    else:
+                        vision_logger.debug(f"收到未知控制事件: {event}")
+                except zmq.Again:
+                    # 没有消息，继续等待
+                    time.sleep(0.1)
+                except Exception as e:
+                    vision_logger.error(f"处理控制消息异常: {e}")
+                    time.sleep(0.1)
+            except Exception as e:
+                vision_logger.error(f"控制消息循环异常: {e}")
+                time.sleep(0.1)
+        vision_logger.info("控制消息接收线程已退出")
+    
     def _image_sender_loop(self):
         """后台线程：从队列取帧，做 JPEG 压缩 + UDP 发送。"""
         while not self._img_thread_stop.is_set():
@@ -718,27 +763,41 @@ class VisionService:
                 # 1. 提取置信度
                 confidence = float(detection.score[0])
                 
-                # 🌟 2. 新增：提取关键点计算正面百分比
+                # 🌟 2. 新增：提取关键点计算正面百分比（任务3：数学平滑与容错优化）
                 keypoints = detection.location_data.relative_keypoints
+                raw_frontal_percent = 0.0
                 if len(keypoints) >= 3:
                     right_eye = keypoints[0]  # 右眼
                     left_eye = keypoints[1]   # 左眼
                     nose_tip = keypoints[2]   # 鼻尖
                     
-                    # 计算两眼中心点和两眼水平距离
-                    eye_center_x = (right_eye.x + left_eye.x) / 2.0
-                    eye_dist = abs(left_eye.x - right_eye.x)
+                    # 🌟 任务3：使用两眼距离作为分母防除零（支持更远距离识别）
+                    eye_dist = abs(right_eye.x - left_eye.x)
                     
-                    # 计算鼻子偏离中心的程度
-                    if eye_dist > 0:
+                    if eye_dist > 0.001:
+                        # 计算两眼中心点
+                        eye_center_x = (right_eye.x + left_eye.x) / 2.0
+                        # 计算鼻子偏离中心的程度（yaw_ratio）
                         offset = abs(nose_tip.x - eye_center_x)
-                        frontal_score = max(0.0, 1.0 - (offset / (eye_dist / 2.0)))
-                    else:
-                        frontal_score = 0.0
+                        yaw_ratio = offset / (eye_dist / 2.0)
                         
-                    frontal_percent = round(frontal_score * 100, 1)
-                else:
-                    frontal_percent = 0.0
+                        # 🌟 任务3：限制 yaw_ratio 的极端值在 -1.5 到 +1.5 之间
+                        yaw_ratio = max(-1.5, min(1.5, yaw_ratio))
+                        
+                        # 计算正面分数
+                        frontal_score = max(0.0, 1.0 - abs(yaw_ratio))
+                        raw_frontal_percent = round(frontal_score * 100, 1)
+                    else:
+                        raw_frontal_percent = 0.0
+                
+                # 🌟 任务3：EMA滤波（在追踪逻辑中）
+                face_id = idx + 1
+                # EMA 平滑滤波：60%历史数据 + 40%最新数据，消除摄像头微抖动
+                smoothed_frontal = 0.6 * self._face_frontal_history.get(face_id, raw_frontal_percent) + 0.4 * raw_frontal_percent
+                frontal_percent = round(smoothed_frontal, 1)
+                
+                # 更新历史记录
+                self._face_frontal_history[face_id] = frontal_percent
                 
                 # 3. 估算距离
                 k_factor = 0.5 
@@ -765,6 +824,12 @@ class VisionService:
 
         # 记录最近一帧的人脸结果，供跳帧插值时复用
         self._last_faces = faces
+        
+        # 🌟 任务3：清理消失的人脸的历史记录（防止内存泄漏）
+        current_face_ids = {face.get("id") for face in faces}
+        disappeared_ids = set(self._face_frontal_history.keys()) - current_face_ids
+        for face_id in disappeared_ids:
+            del self._face_frontal_history[face_id]
 
         # 手部检测（MediaPipe Tasks GestureRecognizer，LIVE_STREAM 异步）
         # 如果 recognizer 尚未初始化成功，安全降级为"仅人脸检测"，hands 为空
@@ -824,62 +889,9 @@ class VisionService:
         result["is_talking"] = is_talking
         return result
     
-    def _update_visual_wake_state(self, faces: List[Dict[str, Any]]):
-        """
-        更新视觉唤醒状态机
-        
-        逻辑：
-        1. 如果未唤醒：检查是否有在3米内且正面率>=75%的人脸，满足则唤醒
-        2. 如果已唤醒：检查所有人是否在[0.1m, 3.5m]区间内，连续N帧不在则取消唤醒
-        """
-        detection_distance = self.vision_wake_config.detection_distance_m
-        frontal_threshold = self.vision_wake_config.frontal_percent_threshold
-        distance_range = self.vision_wake_config.distance_range
-        leave_check_frames = self.vision_wake_config.leave_check_frames
-        
-        if not self._visual_wake_state:
-            # 未唤醒状态：检查是否满足唤醒条件
-            for face in faces:
-                distance = face.get("distance")
-                frontal_percent = face.get("frontal_percent", 0.0)
-                
-                if (distance is not None and 
-                    distance <= detection_distance and 
-                    frontal_percent >= frontal_threshold):
-                    # 满足唤醒条件
-                    self._visual_wake_state = True
-                    self._leave_frame_count = 0
-                    vision_logger.info(
-                        f"视觉唤醒：检测到人脸（距离={distance:.2f}m, "
-                        f"正面率={frontal_percent:.1f}%）"
-                    )
-                    break
-        else:
-            # 已唤醒状态：检查所有人是否在有效距离区间内
-            all_in_range = False
-            for face in faces:
-                distance = face.get("distance")
-                if distance is not None:
-                    min_dist, max_dist = distance_range[0], distance_range[1]
-                    if min_dist <= distance <= max_dist:
-                        all_in_range = True
-                        break
-            
-            if all_in_range:
-                # 有人在有效区间内，重置离开计数
-                self._leave_frame_count = 0
-            else:
-                # 所有人都不在有效区间内，增加离开计数
-                self._leave_frame_count += 1
-                if self._leave_frame_count >= leave_check_frames:
-                    # 连续N帧都不在区间内，取消唤醒
-                    self._visual_wake_state = False
-                    self._leave_frame_count = 0
-                    vision_logger.info("视觉唤醒结束：所有人脸离开有效距离区间")
-    
     def send_result(self, result: Dict[str, Any]):
         """
-        通过 ZMQ PUB 发送检测结果（包含视觉唤醒状态）
+        通过 ZMQ PUB 发送检测结果（纯传感器数据，不包含业务逻辑）
         
         Args:
             result: 检测结果字典
@@ -893,9 +905,8 @@ class VisionService:
                 vision_logger.info(f"👄 [VisionService] 发送 is_talking 状态: {self._last_sent_is_talking} → {is_talking}")
                 self._last_sent_is_talking = is_talking
             
-            # 添加wake字段和timestamp
+            # 只发送原始数据，不包含wake字段（业务逻辑在core_server中处理）
             zmq_data = {
-                "wake": self._visual_wake_state,
                 "faces": result.get("faces", []),
                 "hands": result.get("hands", []),
                 "is_talking": is_talking,
@@ -1006,6 +1017,7 @@ class VisionService:
 
         print("启动相机（Gemini330Driver）...")
         driver.start()
+        
         # 创建退出控制窗口（改善退出体验）
         cv2.namedWindow("VisionServiceControl", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("VisionServiceControl", 200, 100)
@@ -1057,24 +1069,17 @@ class VisionService:
                     result = self.process_frame(bgr)
                     self._last_result = result
                 else:
-                    # 跳帧：复用上一帧的检测结果，但需要更新 track 的 missing_frames
-                    # 这样可以确保手离开后（missing_frames 增加）能及时消失
-                    if hasattr(self, "_last_result") and self._last_result and self.hand_tracks:
-                        # 即使跳帧，也要更新 track 的 missing_frames（模拟没有检测到手的情况）
-                        now_ts = time.time()
-                        # 传入空的 detections，让 _update_hand_tracks 更新 missing_frames
-                        self._update_hand_tracks([], now_ts)
-                        # 基于最新的 track 状态重新构建结果（会过滤掉 missing_frames >= 3 的 track）
+                    # 跳帧：复用上一帧的检测结果，不要去破坏原本的 track 状态
+                    if hasattr(self, "_last_result") and self._last_result:
                         faces = self._last_result.get("faces", [])
+                        # 直接基于现有的 track 重建结果，不用传空数组去清理
                         result = self._build_result_from_tracks(faces)
-                        # 更新其他字段（保持一致性）
                         result["faces"] = faces
                         result["hand_distance_m"] = self._last_result.get("hand_distance_m")
                         result["distance_m"] = self._last_result.get("distance_m")
                         result["presence"] = self._last_result.get("presence", False)
                         result["confidence"] = self._last_result.get("confidence", 0.0)
-                        
-                        # 🌟 修复：必须继承唇动状态，防止跳帧导致状态在 True 和 False 之间疯狂闪烁
+                        # 继承唇动状态
                         result["is_talking"] = self._last_result.get("is_talking", False)
                         
                         self._last_result = result
@@ -1112,10 +1117,9 @@ class VisionService:
 
                 result["distance_m"] = float(global_distance_m) if global_distance_m is not None else None
                 
-                # 视觉唤醒状态机逻辑
-                self._update_visual_wake_state(faces)
+                # 视觉唤醒状态机逻辑已移除，业务逻辑移至core_server
                 
-                # 发送结果（通过ZMQ PUB，包含wake字段）
+                # 发送结果（通过ZMQ PUB，纯传感器数据）
                 self.send_result(result)
                 
                 # 发送 RGB 图像（JPEG，异步）- 每帧都发送以保持流畅
@@ -1145,6 +1149,9 @@ class VisionService:
             cv2.destroyAllWindows()
             # 关闭ZMQ socket
             try:
+                self._ctrl_thread_stop.set()
+                if hasattr(self, '_vision_ctrl_sub_socket'):
+                    self._vision_ctrl_sub_socket.close()
                 self._zmq_pub_socket.close()
                 self.zmq_context.term()
             except Exception:

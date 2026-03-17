@@ -15,14 +15,10 @@ from pydantic import BaseModel, Field, ConfigDict
 # 枚举类型
 # ============================================================================
 
-class SystemState(str, Enum):
-    """系统状态枚举"""
-    IDLE = "IDLE"           # 空闲状态
-    VISUAL_WAKE = "VISUAL_WAKE"  # 视觉唤醒状态
-    LISTENING = "LISTENING"  # 监听状态
-    PROCESSING = "PROCESSING"  # 处理状态（未来用）
-    SPEAKING = "SPEAKING"    # 数字人播报状态
-
+# SystemState枚举已删除，改用布尔标志位：
+# - is_interactive_mode: 是否处于持续对话交互期
+# - is_playing_tts: 当前喇叭是否在出声
+# - is_vision_target_present: 视觉区间[0.4m, 4.5m]内是否有人
 
 class EventType(str, Enum):
     """事件类型枚举"""
@@ -243,6 +239,7 @@ class ZMQConfig(BaseModel):
     tts_push_port: int = 5559         # TTS模块PUSH端口（Core Server PULL从此端口接收音频）
     tts_stop_pub_port: int = 5560     # TTS停止信号PUB端口（Core Server发布，TTS订阅）
     core_control_rep_port: int = 5561  # Core Server控制端口（REP，接收LLM指令）
+    vision_ctrl_pub_port: int = 5564   # 视觉控制PUB端口（Core Server发布控制消息给Vision Service）
 
 
 class VisionWakeConfig(BaseModel):
@@ -253,21 +250,27 @@ class VisionWakeConfig(BaseModel):
     leave_timeout_sec: float = 1.5  # 离开区间持续多久才判定结束（秒）
     leave_check_frames: int = 20  # 连续N帧不在区间内才判定离开
     visual_cutoff_enabled: bool = True  # 启用视觉斩断机制（最高优先级打断）
+    debounce_ms: int = 1000  # 视觉防抖窗口（毫秒）
+    enter_debounce_ms: int = 200  # 进入防抖窗口（毫秒），要求极速响应
+    leave_debounce_ms: int = 300  # 离开防抖窗口（毫秒），快速响应人物离开（从1000ms降低到300ms）
 
 
 class AudioThresholdConfig(BaseModel):
     """音频动态阈值配置"""
-    default: float = 0.85  # 默认高阈值（无人时）
-    visual_wake: float = 0.6  # 视觉唤醒后的低阈值
+    default: float = 0.9  # 默认高阈值（无人时，纯语音唤醒模式）
+    visual_wake: float = 0.6  # 视觉唤醒后的低阈值（视觉降维打击模式）
     change_timeout_ms: int = 100  # 阈值修改指令超时（毫秒）
 
 
 class ConversationConfig(BaseModel):
     """持续对话配置"""
-    vad_silence_timeout_default_sec: float = 3.0  # 默认免唤醒窗口（秒）
-    vad_silence_timeout_extended_sec: float = 15.0  # 未来用于疑问句延长的窗口（秒）
+    vad_silence_timeout_default_sec: float = 5.0  # 宏观超时（秒）：纯语音唤醒模式下，5秒无语音则结束对话
+    vad_silence_timeout_visual_sec: float = 5.0  # 宏观超时（秒）：视觉降维打击模式下，5秒无语音且无唇动则结束对话
+    vad_fast_cutoff_sec: float = 1.5  # 双模态快刀超时（秒）：连续1.5秒无声音且无唇动则结束对话
     vad_check_interval_ms: int = 200  # VAD检查间隔（毫秒）
+    interactive_timeout_sec: float = 90.0  # 交互超时（秒）：90秒无交互则退出交互模式
     vad_rms_threshold: float = 0.003  # VAD RMS阈值（用于简单VAD检测，低于此值视为静音）
+    vad_silence_timeout_extended_sec: float = 15.0  # 未来用于疑问句延长的窗口（秒）- 已废弃，保留用于向后兼容
 
 
 class ASRConfig(BaseModel):
@@ -299,6 +302,17 @@ class TTSConfig(BaseModel):
     min_sentence_length: int = 3  # 最小句子长度（字符数），避免过短片段
     warmup_text: str = "系统初始化"  # 冷启动预热文本
     warmup_enabled: bool = True  # 是否启用冷启动预热
+
+
+class AudioPlaybackConfig(BaseModel):
+    """音频播放配置（从服务器端接收的音频流）"""
+    sample_rate: int = 16000  # 采样率（Hz）
+    # 重要：必须与服务器端TTS输出采样率一致
+    # Qwen3-TTS默认输出24000Hz，如果服务器使用Qwen3-TTS，应设置为24000
+    # 如果服务器使用其他TTS引擎输出16000Hz，则设置为16000
+    format: str = "pcm_int16"  # 音频格式（pcm_int16, pcm_float32等，便于未来扩展）
+    channels: int = 1  # 声道数
+    prebuffer_ms: int = 100  # 预缓冲时长（毫秒），用于网络抖动抑制
 
 
 class LLMAgentConfig(BaseModel):
@@ -346,6 +360,7 @@ class AppConfig(BaseModel):
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    audio_playback: AudioPlaybackConfig = Field(default_factory=AudioPlaybackConfig)
     llm_agent: LLMAgentConfig = Field(default_factory=LLMAgentConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
     environments: EnvironmentsConfig = Field(default_factory=EnvironmentsConfig)
@@ -355,10 +370,7 @@ class AppConfig(BaseModel):
 # 控制命令
 # ============================================================================
 
-class SetSystemStateCommand(BaseModel):
-    """设置系统状态命令"""
-    state: SystemState
-
+# SetSystemStateCommand已删除，因为SystemState枚举已删除
 
 class SetPolicyCommand(BaseModel):
     """动态调整策略命令"""

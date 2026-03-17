@@ -28,6 +28,9 @@ class LipSyncDetector:
         self._talking_confirm_count = 0
         self._talking_confirm_threshold = 3  # 连续3帧都判定为 talking 才输出 True
         
+        # 口型同步状态（由外部控制）
+        self._sync_active = False
+        
         # 初始化 MediaPipe Face Mesh
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -38,6 +41,18 @@ class LipSyncDetector:
         )
         logger.info(f"✅ 唇动检测模块已初始化 (history={history_len}, variance_threshold={variance_threshold}, mar_closed_threshold={mar_closed_threshold})")
 
+    def start_sync(self):
+        """启动口型同步检测"""
+        self._sync_active = True
+        logger.debug("🎬 口型同步检测已启动")
+    
+    def stop_sync(self):
+        """停止口型同步检测，清空历史状态"""
+        self._sync_active = False
+        self.mar_history.clear()
+        self._talking_confirm_count = 0
+        logger.debug("🛑 口型同步检测已停止，历史状态已清空")
+    
     def process_frame(self, frame_rgb: np.ndarray) -> bool:
         """
         处理单帧图像，判断是否在说话
@@ -52,6 +67,10 @@ class LipSyncDetector:
         Returns:
             bool: 是否在说话 (is_talking)
         """
+        # 🌟 只在同步激活时才进行检测
+        if not self._sync_active:
+            return False
+        
         is_talking = False
         try:
             results = self.face_mesh.process(frame_rgb)

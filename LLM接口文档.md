@@ -32,13 +32,18 @@ wss://<host>/api/voice/ws?deviceId=<deviceId>&token=<token>
 **配置示例**（`config/config.yaml`）：
 ```yaml
 llm_agent:
-  host: "127.0.0.1:8080"  # LLM Agent服务地址
+  host: "192.168.0.72:7788"  # LLM Agent服务地址（格式：host:port）
   device_id: "wakefusion-device-01"  # 设备标识
   token: "your-token-here"  # 认证令牌
   use_ssl: false  # 是否使用SSL（true for wss://, false for ws://）
   reconnect_interval_sec: 5.0  # 断线重连间隔（秒）
   ping_interval_sec: 30.0  # 保活ping间隔（秒）
 ```
+
+**注意**：
+- `host` 配置的格式为 `host:port`，例如 `192.168.0.72:7788` 或 `127.0.0.1:8080`
+- 如果使用Mock测试脚本（`tests/mock_llm_agent_simple.py`），需要确保脚本中的 `WS_HOST` 和 `WS_PORT` 与配置一致
+- 服务端必须监听在 `/api/voice/ws` 路径
 
 ### 1.2 设备隔离
 
@@ -174,8 +179,9 @@ llm_agent:
 - `traceId`: 请求标识（可选，用于关联ASR请求）
 
 **处理规则**：
-- 设备接收文本后，通过ZMQ发送给TTS模块进行合成
-- 流式文本会累积，直到收到 `isFinal=true` 才开始合成
+- 设备接收文本后，仅做状态上报（已废弃本地TTS模块）
+- 服务端应在发送route消息后，通过WebSocket二进制帧发送TTS音频流
+- 流式文本会累积，直到收到 `isFinal=true` 表示文本发送完成
 
 ### 3.2 停止TTS合成（stop_tts）
 
@@ -200,7 +206,7 @@ llm_agent:
 }
 ```
 
-### 3.4 警告消息（warning）
+### 3.6 警告消息（warning）
 
 服务端发送警告信息。
 
@@ -212,7 +218,7 @@ llm_agent:
 }
 ```
 
-### 3.5 Ping响应（pong）
+### 3.7 Ping响应（pong）
 
 服务端响应ping消息。
 
@@ -252,14 +258,20 @@ import json
 from typing import Dict, Set
 
 class LLMAgentServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8080):
+    def __init__(self, host: str = "0.0.0.0", port: int = 7788):
         self.host = host
         self.port = port
+        self.path = "/api/voice/ws"  # WebSocket路径
         self.devices: Dict[str, websockets.WebSocketServerProtocol] = {}
         self.device_sessions: Dict[str, str] = {}  # deviceId -> traceId
     
     async def handle_client(self, websocket, path):
         """处理客户端连接"""
+        # 检查路径是否匹配
+        if not path.startswith(self.path):
+            await websocket.close(code=1008, reason="Path not found")
+            return
+        
         # 解析连接参数
         query_params = self._parse_query(path)
         device_id = query_params.get("deviceId")
@@ -275,7 +287,7 @@ class LLMAgentServer:
             return
         
         self.devices[device_id] = websocket
-        print(f"✅ 设备连接: {device_id}")
+        print(f"✅ 设备连接: {device_id} (路径: {path})")
         
         try:
             async for message in websocket:
@@ -387,12 +399,20 @@ class LLMAgentServer:
     
     async def run(self):
         """启动服务器"""
+        async def handler(websocket, path):
+            # 检查路径是否匹配
+            if path.startswith(self.path):
+                await self.handle_client(websocket, path)
+            else:
+                await websocket.close(code=1008, reason="Path not found")
+        
         async with websockets.serve(
-            self.handle_client,
+            handler,
             self.host,
             self.port
         ):
-            print(f"🌐 LLM Agent服务器已启动: ws://{self.host}:{self.port}")
+            print(f"🌐 LLM Agent服务器已启动: ws://{self.host}:{self.port}{self.path}")
+            print(f"   完整连接地址: ws://{self.host}:{self.port}{self.path}?deviceId=<deviceId>&token=<token>")
             await asyncio.Future()  # 永久运行
 
 if __name__ == "__main__":
@@ -442,17 +462,25 @@ response = req_socket.recv_json()
 ```yaml
 # LLM Agent配置
 llm_agent:
-  host: "127.0.0.1:8080"  # LLM Agent服务地址
+  host: "192.168.0.72:7788"  # LLM Agent服务地址（格式：host:port）
   device_id: "wakefusion-device-01"  # 设备标识
   token: "your-token-here"  # 认证令牌
-  use_ssl: false  # 是否使用SSL
+  use_ssl: false  # 是否使用SSL（true for wss://, false for ws://）
   reconnect_interval_sec: 5.0  # 断线重连间隔（秒）
   ping_interval_sec: 30.0  # 保活ping间隔（秒）
+
+# 音频播放配置（必须与服务器端TTS输出采样率一致）
+audio_playback:
+  sample_rate: 16000  # 采样率（Hz）
+  # 如果服务器端使用Qwen3-TTS（24000Hz），应设置为24000
+  # 如果服务器端使用其他TTS引擎输出16000Hz，则设置为16000
+  format: "pcm_int16"
+  channels: 1
+  prebuffer_ms: 100  # 预缓冲时长（毫秒）
 
 # ZMQ配置
 zmq:
   asr_result_push_port: 5562  # ASR推送识别结果给Core Server
-  tts_text_pull_port: 5563  # TTS接收Core Server的合成文本
   core_control_rep_port: 5561  # Core Server控制端口
 ```
 

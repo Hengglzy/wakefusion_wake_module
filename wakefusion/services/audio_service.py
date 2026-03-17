@@ -55,7 +55,10 @@ audio_buffer = np.zeros(buffer_len, dtype=np.float32)
 write_pos = 0  # 环形缓冲区写入位置
 
 # 动态阈值（初始值从配置读取）
-active_threshold = 0.95  # 默认高阈值，将在main()中从配置读取
+active_threshold = 0.9  # 默认高阈值，将在main()中从配置读取（会被config.yaml覆盖）
+
+# 实际打开的声道数（用于智能增益补偿）
+opened_channels = 1  # 默认值，将在main()中根据实际打开的设备设置
 
 # VAD引擎（使用组合模式，完全解耦）
 vad_engine = None  # 将在main()中根据配置初始化
@@ -67,10 +70,16 @@ zmq_rep_socket = None  # 控制流（REP）
 
 stream_queue = queue.Queue()
 
+# ================= 线程安全锁 =================
+zmq_pub_lock = threading.Lock()  # ZMQ PUB Socket 发送锁（防止多线程并发发送导致 C++ Core Dump）
+buffer_lock = threading.Lock()  # 音频环形缓冲区读写锁（防止数据撕裂）
+# =============================================
+
 
 def control_listener_zmq():
     """ZMQ REP控制监听线程：接收动态阈值调整指令"""
     global active_threshold, cooldown_until, is_streaming, audio_buffer, write_pos
+    from wakefusion.config import get_config
     while True:
         try:
             # 接收REQ请求（带超时）
@@ -78,8 +87,10 @@ def control_listener_zmq():
             command = request.get("command")
             if command == "set_threshold":
                 new_threshold = float(request.get("value", active_threshold))
+                old_threshold = active_threshold
                 active_threshold = new_threshold
-                print(f"✅ 阈值已更新: {active_threshold:.2f}")
+                if abs(new_threshold - old_threshold) > 0.01:  # 只有阈值真正变化时才打印
+                    print(f"\n✅ 阈值已更新: {old_threshold:.2f} → {active_threshold:.2f}")
                 # 快速响应
                 zmq_rep_socket.send_json({"status": "ok", "threshold": active_threshold})
             elif command == "reset_cooldown":
@@ -92,11 +103,45 @@ def control_listener_zmq():
                 zmq_rep_socket.send_json({"status": "ok", "cooldown_reset": True})
             elif command == "start_streaming":
                 cooldown_until = 0
+                
+                # =======================================================
+                # 🚑 音频回捞机制：从Ring Buffer中切出过去800ms的音频
+                # 🔒 加锁防止与 audio_callback 的数据撕裂
+                # =======================================================
+                audio_config = get_config().audio
+                pre_roll_ms = audio_config.pre_roll_ms  # 从配置读取，默认800ms
+                pre_roll_samples = int(pre_roll_ms / 1000.0 * SAMPLE_RATE)
+                
+                # 从环形缓冲区按正确顺序读取音频（加锁保护）
+                with buffer_lock:
+                    pos = write_pos  # 快照当前写入位置
+                    ordered_audio = np.concatenate([
+                        audio_buffer[pos:],
+                        audio_buffer[:pos]
+                    ])
+                    
+                    # 提取过去800ms的音频（如果缓冲区中有足够的数据）
+                    rescue_samples = min(pre_roll_samples, len(ordered_audio))
+                    rescue_audio = ordered_audio[-rescue_samples:].copy()
+                    
+                    # 重置缓冲区，防止混入旧声音（回捞后清空）
+                    audio_buffer.fill(0.0)
+                    write_pos = 0
+                
+                # 将回捞音频转 int16 并切片推入队列（与正常推流保持一致）
+                rescue_audio_int16 = (rescue_audio * 32767).astype(np.int16)
+                chunk_size = int(SAMPLE_RATE * STEP_DURATION)  # 0.2秒一块
+                for i in range(0, len(rescue_audio), chunk_size):
+                    chunk = rescue_audio[i:i + chunk_size]
+                    try:
+                        stream_queue.put_nowait(chunk)
+                    except queue.Full:
+                        pass
+                
+                # 启动流模式（开始发送实时音频）
                 is_streaming = True
-                # 重置缓冲区，防止混入旧声音
-                audio_buffer.fill(0.0)
-                write_pos = 0
-                print("✅ 收到中枢指令：进入免唤醒持续拾音模式 (开始推流)")
+                
+                print(f"✅ 收到中枢指令：进入免唤醒持续拾音模式 (开始推流，已回捞{pre_roll_ms}ms音频)")
                 zmq_rep_socket.send_json({"status": "ok"})
             elif command == "stop_streaming":
                 # 🌟 修复：停止音频推流（进入PROCESSING状态时）
@@ -160,11 +205,12 @@ def network_sender():
             }
             
             # 第二帧：纯二进制PCM数据（int16）
-            # 使用Multipart Message发送
-            zmq_pub_socket.send_multipart([
-                json.dumps(metadata).encode('utf-8'),
-                chunk_int16.tobytes()
-            ], zmq.NOBLOCK)
+            # 使用Multipart Message发送（加锁防止多线程并发导致 C++ Core Dump）
+            with zmq_pub_lock:
+                zmq_pub_socket.send_multipart([
+                    json.dumps(metadata).encode('utf-8'),
+                    chunk_int16.tobytes()
+                ], zmq.NOBLOCK)
         except zmq.Again:
             # 发送缓冲区满，丢弃此帧
             pass
@@ -306,9 +352,18 @@ def main():
     def audio_callback(indata, frames, time_info, status):
         global write_pos
         if status:
-            pass  # 屏蔽底层警告
-
-        new_data = indata[:, 0]
+            pass  # 忽略轻微的状态警告
+        
+        # 🌟 任务2：核心修复：无论硬件返回多少个声道，我们只取第 0 个声道（主麦）
+        # 必须使用 .copy()，否则切片后的数组内存不连续，后续 .tobytes() 会导致底层 C++ 崩溃！
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            new_data = indata[:, 0].copy()
+            # 如果被迫使用了原生多声道（>2），拿到的是缺乏硬件AGC放大的裸麦克风数据，声音极小
+            # 因此进行 4.0 倍的软件数字增益补偿，拯救 OWW 唤醒率
+            if opened_channels > 2:
+                new_data = np.clip(new_data * 4.0, -1.0, 1.0)
+        else:
+            new_data = indata.flatten().copy()
 
         # 增益补偿并防止爆音裁剪
         new_data = np.clip(new_data * AUDIO_GAIN, -1.0, 1.0)
@@ -320,21 +375,48 @@ def main():
                 pass
         else:
             # 🌟 第四层：环形缓冲区原地写入，避免 np.roll 创建新数组的竞态问题
-            n = len(new_data)
-            if write_pos + n <= buffer_len:
-                audio_buffer[write_pos:write_pos + n] = new_data
-                write_pos += n
-            else:
-                # 到达末尾，环形回绕
-                first_part = buffer_len - write_pos
-                audio_buffer[write_pos:] = new_data[:first_part]
-                audio_buffer[:n - first_part] = new_data[first_part:]
-                write_pos = n - first_part
+            # 🔒 加锁防止与回捞逻辑的数据撕裂
+            with buffer_lock:
+                n = len(new_data)
+                if write_pos + n <= buffer_len:
+                    audio_buffer[write_pos:write_pos + n] = new_data
+                    write_pos += n
+                else:
+                    # 到达末尾，环形回绕
+                    first_part = buffer_len - write_pos
+                    audio_buffer[write_pos:] = new_data[:first_part]
+                    audio_buffer[:n - first_part] = new_data[first_part:]
+                    write_pos = n - first_part
 
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, blocksize=int(SAMPLE_RATE * STEP_DURATION),
-        device=DEVICE_ID, callback=audio_callback
-    )
+    # 🌟 任务1：智能声道降级策略
+    global opened_channels
+    device_info = sd.query_devices(DEVICE_ID, 'input')
+    max_hw_channels = int(device_info.get('max_input_channels', 1))
+    
+    stream = None
+    opened_channels = 1
+    
+    # 智能声道降级策略：首选1声道(获取硬件DSP处理与AGC放大) -> 备选2声道 -> 终极原生多声道
+    for ch in [1, 2, max_hw_channels]:
+        try:
+            stream = sd.InputStream(
+                device=DEVICE_ID,
+                channels=ch,
+                samplerate=SAMPLE_RATE,
+                blocksize=int(SAMPLE_RATE * STEP_DURATION),
+                callback=audio_callback,
+                dtype=np.float32
+            )
+            opened_channels = ch
+            print(f"🎤 成功以 {ch} 声道模式打开麦克风！")
+            break
+        except Exception as e:
+            pass  # 静默失败，尝试下一个
+            
+    if stream is None:
+        print("🚨 麦克风打开彻底失败！请检查 Windows 声音控制面板中的默认采样率是否为 16000Hz！")
+        import sys
+        sys.exit(1)
 
     print("\n" + "=" * 60)
     print("🎙️ Audio Service 已启动 (ZMQ版本)")
@@ -360,21 +442,24 @@ def main():
                     continue
 
                 if time.time() < cooldown_until:
-                    audio_buffer.fill(0.0)
-                    write_pos = 0
+                    with buffer_lock:
+                        audio_buffer.fill(0.0)
+                        write_pos = 0
                     consecutive_hits = 0
                     print("❄️ 冷却中...          ", end='\r')
                     continue
 
-                # 从环形缓冲区中按正确顺序读取完整音频
-                pos = write_pos  # 快照当前写入位置
-                current_audio = np.concatenate([
-                    audio_buffer[pos:],
-                    audio_buffer[:pos]
-                ])
+                # 从环形缓冲区中按正确顺序读取完整音频（加锁保护）
+                with buffer_lock:
+                    pos = write_pos  # 快照当前写入位置
+                    current_audio = np.concatenate([
+                        audio_buffer[pos:],
+                        audio_buffer[:pos]
+                    ]).copy()  # 复制一份，避免持有锁时间过长
 
                 # 🌟 第一层：静音门限 (VAD)
                 # 使用Silero VAD进行智能检测（如果已初始化）
+                is_speech_detected = True
                 if vad_engine is not None:
                     # 【修复】只取最后 0.2 秒送给VAD，保证RNN时间线连续，避免喂入重复数据
                     # 如果传入整个 2.0 秒的缓冲区，会导致重叠数据破坏RNN的时间感知
@@ -382,14 +467,23 @@ def main():
                     latest_audio = current_audio[-latest_chunk_samples:]
                     latest_audio_int16 = (latest_audio * 32767).astype(np.int16)
                     
-                    if not vad_engine.is_speech(latest_audio_int16):
-                        consecutive_hits = 0  # 静音时重置连续计数
+                    is_speech_detected = vad_engine.is_speech(latest_audio_int16)
+                    if not is_speech_detected:
+                        # 静音时重置连续计数，并显示监听状态
+                        if consecutive_hits > 0:
+                            print()  # 换行，避免覆盖"疑似唤醒"信息
+                        consecutive_hits = 0
+                        print(f"听... (静音, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
                         continue
                 else:
                     # 降级方案：使用RMS阈值（向后兼容）
                     rms = np.sqrt(np.mean(current_audio**2))
                     if rms < VAD_RMS_THRESHOLD:
-                        consecutive_hits = 0  # 静音时重置连续计数
+                        # 静音时重置连续计数，并显示监听状态
+                        if consecutive_hits > 0:
+                            print()  # 换行，避免覆盖"疑似唤醒"信息
+                        consecutive_hits = 0
+                        print(f"听... (静音, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
                         continue
 
                 # 🌟 推理（NeMo 或 OWW，由 infer() 闭包统一处理）
@@ -402,7 +496,7 @@ def main():
                     if consecutive_hits >= CONSECUTIVE_HITS_REQUIRED:
                         # ✅ 唤醒确认！
                         now_str = datetime.now().strftime("%H:%M")
-                        print(f"⚡ 唤醒成功！(置信度={conf:.2%}) 🕐 {now_str}")
+                        print(f"\n⚡ 唤醒成功！(置信度={conf:.2%}) 🕐 {now_str}")
                         print(f"   切换为音频推流模式...")
 
                         # =======================================================
@@ -411,14 +505,17 @@ def main():
                         # =======================================================
 
                         # Step 1: 从环形缓冲区按正确时序抢救最后 N 秒音频
+                        # 🔒 加锁防止与 audio_callback 的数据撕裂
                         rescue_samples = int(RESCUE_SECONDS * SAMPLE_RATE)
-                        pos = write_pos  # 快照写入位置
-                        ordered_audio = np.concatenate([
-                            audio_buffer[pos:], audio_buffer[:pos]
-                        ])
-                        rescue_audio = ordered_audio[-rescue_samples:].copy()
+                        with buffer_lock:
+                            pos = write_pos  # 快照写入位置
+                            ordered_audio = np.concatenate([
+                                audio_buffer[pos:], audio_buffer[:pos]
+                            ])
+                            rescue_audio = ordered_audio[-rescue_samples:].copy()
 
                         # Step 2: 发送唤醒事件（通过ZMQ PUB，使用Multipart Message）
+                        # 🔒 加锁防止与 network_sender 线程的并发发送导致 C++ Core Dump
                         wake_metadata = {
                             "vad": True,
                             "wake_word": {
@@ -430,14 +527,15 @@ def main():
                         }
                         # 发送一个空的音频帧作为唤醒标记（或发送一个特殊标记）
                         wake_audio = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.int16)
-                        zmq_pub_socket.send_multipart([
-                            json.dumps(wake_metadata).encode('utf-8'),
-                            wake_audio.tobytes()
-                        ], zmq.NOBLOCK)
+                        with zmq_pub_lock:
+                            zmq_pub_socket.send_multipart([
+                                json.dumps(wake_metadata).encode('utf-8'),
+                                wake_audio.tobytes()
+                            ], zmq.NOBLOCK)
 
                         # Step 3: 将抢救的音频切片推入队列（必须在 is_streaming=True 之前！）
-                        #   切成 0.1 秒小块，模拟麦克风连续吐数据，避免单个超大 UDP 包丢包
-                        chunk_size = int(SAMPLE_RATE * 0.1)
+                        #   切成 0.2 秒小块（与正常推流保持一致），减少唤醒瞬间 ZMQ 并发发包开销
+                        chunk_size = int(SAMPLE_RATE * 0.2)  # 从0.1改为0.2，与STEP_DURATION保持一致
                         for i in range(0, len(rescue_audio), chunk_size):
                             chunk = rescue_audio[i:i + chunk_size]
                             try:
@@ -452,16 +550,22 @@ def main():
 
                         print(f"   🌊 已将前 {RESCUE_SECONDS}s 指令音频无缝桥接入推流队列！")
 
-                        # Step 5: 清空缓存，进入冷却
-                        audio_buffer.fill(0.0)
-                        write_pos = 0
+                        # Step 5: 清空缓存，进入冷却（加锁保护）
+                        with buffer_lock:
+                            audio_buffer.fill(0.0)
+                            write_pos = 0
                         consecutive_hits = 0
                         cooldown_until = time.time() + COOLDOWN_SECONDS
                     else:
-                        print(f"🔍 疑似唤醒... (连续{consecutive_hits}/{CONSECUTIVE_HITS_REQUIRED}, 置信度={conf:.2%})", end='\r')
+                        # 连续命中但未达到要求，显示疑似唤醒
+                        print(f"🔍 疑似唤醒... (连续{consecutive_hits}/{CONSECUTIVE_HITS_REQUIRED}, 置信度={conf:.2%}, 阈值={active_threshold:.2f})", end='\r', flush=True)
                 else:
+                    # 置信度低于阈值或不是唤醒词，重置计数并显示正常监听状态
+                    if consecutive_hits > 0:
+                        # 如果之前有连续命中，先换行再显示，避免覆盖
+                        print()  # 换行，避免覆盖"疑似唤醒"信息
                     consecutive_hits = 0  # 一旦中断，重置计数
-                    print(f"听... ({label} {conf:.1%})        ", end='\r')
+                    print(f"听... ({label} {conf:.1%}, 阈值={active_threshold:.2f})        ", end='\r', flush=True)
 
         except KeyboardInterrupt:
             print("\n🛑 服务已关闭。")

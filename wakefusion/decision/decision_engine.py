@@ -11,7 +11,7 @@ from enum import Enum
 from datetime import datetime
 
 from wakefusion.types import (
-    BaseEvent, EventType, SystemState,
+    BaseEvent, EventType,
     KWSHitPayload, WakeConfirmedPayload, HealthPayload
 )
 from wakefusion.logging import get_logger
@@ -68,8 +68,8 @@ class DecisionEngine:
         self.barge_in_enabled = barge_in_enabled
         self.event_callback = event_callback
 
-        # 状态
-        self.system_state = SystemState.IDLE
+        # 状态（SystemState已删除，使用字符串常量）
+        self.system_state = "IDLE"  # 可能的值: "IDLE", "LISTENING", "SPEAKING", "PROCESSING"
         self.fusion_state = FusionState.IDLE
         self.current_kws: Optional[Dict[str, Any]] = None
         self.current_vad_state: Optional[str] = None
@@ -97,12 +97,12 @@ class DecisionEngine:
         """生成会话ID"""
         return f"fusion-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    def set_system_state(self, state: SystemState):
+    def set_system_state(self, state: str):
         """
         设置系统状态
 
         Args:
-            state: 系统状态
+            state: 系统状态（字符串，可能的值: "IDLE", "LISTENING", "SPEAKING", "PROCESSING"）
         """
         old_state = self.system_state
         self.system_state = state
@@ -171,7 +171,7 @@ class DecisionEngine:
         )
 
         # 检查是否应该进入打断模式
-        if self.system_state == SystemState.SPEAKING and self.barge_in_enabled:
+        if self.system_state == "SPEAKING" and self.barge_in_enabled:
             return self._handle_barge_in(payload)
 
         # 检查视觉门控

@@ -19,7 +19,7 @@ from wakefusion.decision import DecisionEngine, VisionGateResult
 from wakefusion.io import WSEventPublisher, HealthServer
 
 from wakefusion.types import (
-    BaseEvent, EventType, AudioFrameRaw, AudioFrame, SystemState, VisionFrame
+    BaseEvent, EventType, AudioFrameRaw, AudioFrame, VisionFrame
 )
 
 
