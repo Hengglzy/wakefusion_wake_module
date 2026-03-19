@@ -11,12 +11,12 @@ logger = logging.getLogger("lip_sync")
 logger.setLevel(logging.INFO)
 
 class LipSyncDetector:
-    def __init__(self, history_len=10, variance_threshold=0.0005, mar_closed_threshold=0.12):
+    def __init__(self, history_len=5, variance_threshold=0.0003, mar_closed_threshold=0.10):
         """
         初始化唇动检测器
         Args:
-            history_len: 追踪历史帧数（默认10帧，约0.3秒）
-            variance_threshold: 判定为说话的 MAR 方差阈值（越小越灵敏，默认0.0005）
+            history_len: 追踪历史帧数（默认5帧，约0.15秒）
+            variance_threshold: 判定为说话的 MAR 方差阈值（越小越灵敏，默认0.0003）
             mar_closed_threshold: 嘴巴闭合的绝对 MAR 阈值（低于此值直接判定为不说话）
         """
         self.history_len = history_len
@@ -26,10 +26,7 @@ class LipSyncDetector:
         
         # 状态稳定性：要求连续多帧都是 talking 才输出 True（减少抖动误报）
         self._talking_confirm_count = 0
-        self._talking_confirm_threshold = 3  # 连续3帧都判定为 talking 才输出 True
-        
-        # 口型同步状态（由外部控制）
-        self._sync_active = False
+        self._talking_confirm_threshold = 2  # 🌟 2帧防抖
         
         # 初始化 MediaPipe Face Mesh
         self.mp_face_mesh = mp.solutions.face_mesh
@@ -42,16 +39,12 @@ class LipSyncDetector:
         logger.info(f"✅ 唇动检测模块已初始化 (history={history_len}, variance_threshold={variance_threshold}, mar_closed_threshold={mar_closed_threshold})")
 
     def start_sync(self):
-        """启动口型同步检测"""
-        self._sync_active = True
-        logger.debug("🎬 口型同步检测已启动")
+        """启动口型同步检测（已废弃，保留接口兼容性）"""
+        pass
     
     def stop_sync(self):
-        """停止口型同步检测，清空历史状态"""
-        self._sync_active = False
-        self.mar_history.clear()
-        self._talking_confirm_count = 0
-        logger.debug("🛑 口型同步检测已停止，历史状态已清空")
+        """停止口型同步检测（已废弃，保留接口兼容性）"""
+        pass
     
     def process_frame(self, frame_rgb: np.ndarray) -> bool:
         """
@@ -67,10 +60,6 @@ class LipSyncDetector:
         Returns:
             bool: 是否在说话 (is_talking)
         """
-        # 🌟 只在同步激活时才进行检测
-        if not self._sync_active:
-            return False
-        
         is_talking = False
         try:
             results = self.face_mesh.process(frame_rgb)

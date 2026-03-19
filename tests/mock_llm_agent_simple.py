@@ -10,13 +10,16 @@
 5. 发送模拟的音频流（二进制帧，16kHz PCM提示音）
 6. 发送TTS_DONE消息
 7. 支持interrupt打断机制
-8. 支持键盘监听（输入'q'发送interrupt）
+8. 支持stop强制休眠机制
+9. 支持audio_cancel垃圾回收机制
+10. 支持键盘监听（输入'q'发送interrupt，输入's'发送stop）
 
 使用方法：
 1. 启动所有WakeFusion服务（视觉、音频、Core Server）
 2. 运行此脚本：python tests/mock_llm_agent_simple.py
 3. 进行唤醒和对话测试
 4. 输入'q'并按回车可发送interrupt指令
+5. 输入's'并按回车可发送stop指令（强制休眠）
 """
 
 import asyncio
@@ -104,6 +107,15 @@ class MockAgent:
                                 }))
                                 self.is_speaking = False
                         
+                        elif msg_type == "audio_cancel":
+                            reason = data.get("reason", "unknown")
+                            logger.warning(f"🗑️ 收到客户端 audio_cancel 指令，清空并丢弃当前音频缓存 (原因: {reason})")
+                            # 重置服务端状态，清除痕迹，不触发任何大模型思考和回复
+                            if self.response_task:
+                                self.response_task.cancel()
+                            self.is_speaking = False
+                            self.current_trace_id = None
+                        
                         elif msg_type == "audio_end":
                             # 用户说话结束
                             trace_id = data.get("trace_id")
@@ -177,9 +189,15 @@ class MockAgent:
             # 1. 延时 0.5s
             await asyncio.sleep(0.5)
             
-            # 2. 🌟 发送 ASR 结果（模拟）：用户语音转文字
-            asr_text = "你好小康，今天怎么样啊？"
-            logger.info(f"📤 发送ASR结果（模拟）: {asr_text}")
+            # 2. 🌟 发送 ASR 结果（模拟）：用户语音转文字（附带时间戳证明动态性）
+            current_time = datetime.now().strftime("%H:%M:%S")
+            asr_text = f"你好小康，今天天气怎么样啊？({current_time})"
+            logger.info(f"📤 发送ASR结果: {asr_text}")
+            await websocket.send(json.dumps({
+                "type": "asr",
+                "text": asr_text
+            }))
+            # 兼容旧版协议
             await websocket.send(json.dumps({
                 "type": "asr_result",
                 "text": asr_text,
@@ -191,21 +209,27 @@ class MockAgent:
             # 3. 延时 0.5s
             await asyncio.sleep(0.5)
             
-            # 4. 🌟 发送 AI 回复文本
-            reply_text = "我是小康，很高兴为你服务，请等待后续 API 的开发。"
-            logger.info(f"📤 发送AI回复: {reply_text}")
+            # 4. 🌟 发送 AI 回复文本（附带时间戳证明动态性）
+            ai_text = f"我是小康，现在是 {current_time}，很高兴为你服务！"
+            logger.info(f"📤 发送AI回复: {ai_text}")
             
-            # 发送给 core_server，让其转发给 UI
+            # 发送给 core_server，让其转发给 UI（新版协议）
+            await websocket.send(json.dumps({
+                "type": "text",
+                "text": ai_text
+            }))
+            
+            # 发送给 core_server，让其转发给 UI（兼容旧版）
             await websocket.send(json.dumps({
                 "type": "route",
-                "text": reply_text,
+                "text": ai_text,
                 "isFinal": True
             }))
             
             # 兼容 app.html 的直接识别
             await websocket.send(json.dumps({
                 "type": "chat_reply",
-                "text": reply_text
+                "text": ai_text
             }))
             
             # 5. 发送动作指令 (让 Unity 数字人做动作)
@@ -286,11 +310,34 @@ class MockAgent:
         
         # 清理断开的连接
         self.connected_clients -= disconnected
+    
+    async def broadcast_stop(self):
+        """向所有连接的客户端广播stop指令"""
+        if not self.connected_clients:
+            return
+        
+        stop_msg = json.dumps({
+            "type": "stop",
+            "reason": "server_stopped_by_admin"
+        })
+        
+        # 向所有客户端发送stop
+        disconnected = set()
+        for client in self.connected_clients:
+            try:
+                await client.send(stop_msg)
+                logger.info(f"📤 已向客户端广播 stop 指令")
+            except Exception as e:
+                logger.warning(f"⚠️ 向客户端发送stop失败: {e}")
+                disconnected.add(client)
+        
+        # 清理断开的连接
+        self.connected_clients -= disconnected
 
 
 def keyboard_listener(agent, loop):
-    """键盘监听线程：读取stdin，输入'q'发送interrupt"""
-    logger.info("⌨️ 键盘监听线程已启动（输入'q'并按回车可发送interrupt指令）")
+    """键盘监听线程：读取stdin，输入'q'发送interrupt，输入's'发送stop"""
+    logger.info("⌨️ 键盘监听线程已启动（输入'q'发送interrupt，输入's'发送stop指令）")
     while True:
         try:
             line = sys.stdin.readline().strip().lower()
@@ -301,8 +348,15 @@ def keyboard_listener(agent, loop):
                     agent.broadcast_interrupt(),
                     loop
                 )
+            elif line == 's':
+                logger.info("⌨️ 检测到's'输入，发送stop指令（强制休眠）...")
+                # 使用线程安全的方式调用异步函数
+                asyncio.run_coroutine_threadsafe(
+                    agent.broadcast_stop(),
+                    loop
+                )
             elif line:
-                logger.info(f"⌨️ 收到输入: {line}（输入'q'可发送interrupt）")
+                logger.info(f"⌨️ 收到输入: {line}（输入'q'发送interrupt，输入's'发送stop）")
         except Exception as e:
             logger.error(f"❌ 键盘监听异常: {e}")
             break
@@ -324,7 +378,9 @@ async def main():
     logger.info("  4. 发送数字人动作指令（shuohua4）")
     logger.info("  5. 发送模拟音频流（440Hz正弦波，2.5秒）")
     logger.info("  6. 支持 interrupt 打断机制")
-    logger.info("  7. 支持键盘监听（输入'q'发送interrupt）")
+    logger.info("  7. 支持 stop 强制休眠机制")
+    logger.info("  8. 支持 audio_cancel 垃圾回收机制")
+    logger.info("  9. 支持键盘监听（输入'q'发送interrupt，输入's'发送stop）")
     logger.info("")
     logger.info("配置说明:")
     logger.info(f"  - 确保config/config.yaml中的llm_agent.host配置为: {WS_HOST}:{WS_PORT}")
@@ -335,6 +391,7 @@ async def main():
     logger.info("  2. 进行唤醒和对话测试")
     logger.info("  3. 观察日志输出和音频播放")
     logger.info("  4. 输入'q'并按回车可发送interrupt指令")
+    logger.info("  5. 输入's'并按回车可发送stop指令（强制休眠）")
     logger.info("=" * 60)
     logger.info("")
     

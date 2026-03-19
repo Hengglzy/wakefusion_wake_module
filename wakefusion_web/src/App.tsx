@@ -70,9 +70,8 @@ export default function App() {
   const colleagueUrl = "https://example.com"; 
 
   // --- 2. 状态管理 ---
-  const [messages, setMessages] = useState<Message[]>([
-    { id: 'init', text: 'SYSTEM READY: NEURAL LINK ESTABLISHED.', sender: 'ai', timestamp: new Date() }
-  ]);
+  // 🌟 使用统一的对话列表，保证气泡顺序自然（不再分两个孤立的 state）
+  const [messages, setMessages] = useState<{id: string, type: 'user'|'ai', text: string}[]>([]);
   const [isUnityLoaded, setIsUnityLoaded] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0);
   const [uiOpacity, setUiOpacity] = useState(1);
@@ -125,55 +124,84 @@ export default function App() {
 
   // --- 4. WebSocket 通信逻辑 ---
   useEffect(() => {
-    const connectWS = () => {
-      const ws = new WebSocket('ws://127.0.0.1:8765');
+    let ws: WebSocket | null = null;
+    let isCleaningUp = false;
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
+
+    const connect = () => {
+      if (isCleaningUp) return;
+      
+      ws = new WebSocket("ws://127.0.0.1:8765");
       wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log("✅ Web UI 已成功连接到 Core Server");
+      };
+
+      // 🌟 修复：无论第一次还是重连，都必须重新绑定 onmessage！
       ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "asr_result") appendMessage(msg.text, 'user');
-          else if (msg.type === "chat_reply") appendMessage(msg.text, 'ai');
-          else if (msg.action === "playAudio" && window.unityInstance) {
-            window.unityInstance.SendMessage("WebCommunication", "OnPlayAudio", JSON.stringify(msg.data));
+          const data = JSON.parse(event.data);
+          
+          if (data.type === "subtitle_user") {
+            // 用户开口：生成唯一ID，并强行清空旧列表，开始新一轮对话字幕
+            const uniqueId = Date.now().toString() + "-user";
+            setMessages([{ id: uniqueId, type: 'user', text: data.text }]);
+            wakeUpUI();
+          } 
+          else if (data.type === "subtitle_ai") {
+            // AI 回复：生成唯一ID，追加到列表后方
+            const uniqueId = Date.now().toString() + "-ai-" + Math.random().toString(36).substring(2, 6);
+            setMessages(prev => [...prev, { id: uniqueId, type: 'ai', text: data.text }]);
+            wakeUpUI();
+          } 
+          else if (data.type === "subtitle_clear") {
+            // 收到打断或休眠，清空屏幕字幕
+            setMessages([]); 
           }
-        } catch (e) { console.error(e); }
-      };
-      ws.onclose = () => setTimeout(connectWS, 3000);
-    };
-    connectWS();
-    return () => wsRef.current?.close();
-  }, []);
-
-  // --- 5. 演示模式：各自对话三句后停止20秒循环 ---
-  useEffect(() => {
-    let messageCount = 0;
-    let isPaused = false;
-
-    const runCycle = () => {
-      if (isPaused) return;
-
-      if (messageCount < 6) {
-        if (messageCount % 2 === 0) {
-          appendMessage(`[AI] 神经网络响应测试 #${Math.floor(messageCount/2) + 1}`, 'ai');
-        } else {
-          appendMessage(`[USER] 收到，同步率正常 #${Math.floor(messageCount/2) + 1}`, 'user');
+          
+          // Unity 动作指令透传
+          if (data.action === "playAudio" && window.unityInstance) {
+            window.unityInstance.SendMessage("WebCommunication", "OnPlayAudio", JSON.stringify(data.data));
+          }
+        } catch (err) {
+          console.error("WS 解析失败", err);
         }
-        messageCount++;
-        setTimeout(runCycle, 2000);
-      } else {
-        // 完成6句对话，进入20秒停顿
-        isPaused = true;
-        setTimeout(() => {
-          isPaused = false;
-          messageCount = 0;
-          runCycle();
-        }, 20000);
+      };
+
+      ws.onclose = () => {
+        // 只有在非主动卸载组件的情况下，才尝试断线重连
+        if (!isCleaningUp) {
+          reconnectTimeout = setTimeout(connect, 3000);
+        }
+      };
+      
+      ws.onerror = () => {
+        // 静默捕获报错，防止红字污染控制台
+      };
+    };
+
+    // 🌟 核心修复：延迟 150ms 连接，完美避开 React StrictMode 的瞬间挂载/卸载风暴
+    const startTimeout = setTimeout(connect, 150);
+
+    return () => {
+      // 清理逻辑，彻底掐断幽灵连接
+      isCleaningUp = true;
+      clearTimeout(startTimeout);
+      clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.onclose = null; // 摘除回调，防止触发重连
+        ws.onerror = null;
+        ws.close();
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
       }
     };
-
-    runCycle();
-    return () => { isPaused = true; };
   }, []);
+
+  // --- 5. 演示模式已移除，改为完全数据驱动 ---
 
   // --- 6. UI 唤醒与自动隐藏逻辑 ---
   const wakeUpUI = () => {
@@ -189,14 +217,15 @@ export default function App() {
   };
 
   const appendMessage = (text: string, sender: 'user' | 'ai') => {
+    // 兼容旧版协议：将 sender 转换为 type
+    const type = sender === 'user' ? 'user' : 'ai';
     setMessages(prev => {
       // 如果当前是休眠状态，清空旧消息，只显示新的
       const base = isSleeping ? [] : prev.slice(-4);
       return [...base, {
         id: Date.now().toString() + Math.random(),
-        text,
-        sender,
-        timestamp: new Date()
+        type,
+        text
       }];
     });
     wakeUpUI();
@@ -247,7 +276,7 @@ export default function App() {
         </div>
       </motion.div>
 
-      {/* 4. 赛博对话 UI 层 (同步锁屏/解锁特效) */}
+      {/* 4. 赛博对话 UI 层 (同步锁屏/解锁特效，完全数据驱动) */}
       <motion.div 
         initial={{ opacity: 0, scale: 0.9 }}
         animate={{ 
@@ -259,69 +288,65 @@ export default function App() {
       >
         <div className="w-full flex flex-col justify-end gap-10">
           <AnimatePresence mode="popLayout">
-            {messages.map((msg, index) => {
-              const opacity = (index + 1) / messages.length;
-              
-              return (
-                <motion.div
-                  key={msg.id}
-                  layout
-                  initial={{ 
-                    opacity: 0, 
-                    x: msg.sender === 'ai' ? -200 : 200, // 从退出的方向反向进入
-                    scale: 0.8,
-                    filter: 'blur(10px)' 
-                  }}
-                  animate={{ 
-                    opacity: opacity, 
-                    x: 0, 
-                    scale: 1,
-                    filter: 'blur(0px)' 
-                  }}
-                  exit={{ 
-                    opacity: 0, 
-                    scale: 0.8, 
-                    x: msg.sender === 'ai' ? -200 : 200, // AI向左退，User向右退
-                    filter: 'blur(10px)' 
-                  }}
-                  transition={{ duration: 0.5, ease: "easeOut" }}
-                  className="grid grid-cols-5 w-full gap-12"
-                  style={{ opacity }} 
-                >
-                  {msg.sender === 'ai' ? (
-                    <div className="col-start-2 col-span-2 flex justify-start pointer-events-auto">
-                      <div className="glass-neural-ai scanline px-10 py-6">
-                        <DataStream />
-                        <div className="relative z-10">
-                          <div className="flex items-center gap-3 mb-2 opacity-40">
-                            <div className="w-2 h-2 bg-cyan-400 animate-ping" />
-                            <span className="text-[10px] tracking-[0.2em] text-cyan-400 font-bold uppercase">Entity_Response</span>
-                          </div>
-                          <p className="text-2xl font-bold text-cyan-50 leading-tight tracking-tight">
-                            <CascadeTypewriter text={msg.text} />
-                          </p>
+            {/* 🌟 动态字幕渲染区：统一的 messages 列表 */}
+            {messages.map((msg) => (
+              <motion.div
+                key={msg.id}
+                layout
+                initial={{ 
+                  opacity: 0, 
+                  x: msg.type === 'ai' ? -200 : 200,
+                  scale: 0.8,
+                  filter: 'blur(10px)' 
+                }}
+                animate={{ 
+                  opacity: 1, 
+                  x: 0, 
+                  scale: 1,
+                  filter: 'blur(0px)' 
+                }}
+                exit={{ 
+                  opacity: 0, 
+                  scale: 0.8, 
+                  x: msg.type === 'ai' ? -200 : 200,
+                  filter: 'blur(10px)' 
+                }}
+                transition={{ duration: 0.5, ease: "easeOut" }}
+                className="grid grid-cols-5 w-full gap-12"
+              >
+                {msg.type === 'ai' ? (
+                  <div className="col-start-2 col-span-2 flex justify-start pointer-events-auto">
+                    <div className="glass-neural-ai scanline px-10 py-6">
+                      <DataStream />
+                      <div className="relative z-10">
+                        <div className="flex items-center gap-3 mb-2 opacity-40">
+                          <div className="w-2 h-2 bg-cyan-400 animate-ping" />
+                          <span className="text-[10px] tracking-[0.2em] text-cyan-400 font-bold uppercase">Entity_Response</span>
                         </div>
+                        <p className="text-2xl font-bold text-cyan-50 leading-tight tracking-tight">
+                          <CascadeTypewriter text={msg.text} />
+                        </p>
                       </div>
                     </div>
-                  ) : (
-                    <div className="col-start-4 col-span-2 flex justify-end pointer-events-auto">
-                      <div className="glass-neural-user scanline px-10 py-6">
-                        <DataStream />
-                        <div className="relative z-10">
-                          <div className="flex items-center justify-end gap-3 mb-2 opacity-40">
-                            <span className="text-[10px] tracking-[0.2em] text-fuchsia-400 font-bold uppercase">User_Input</span>
-                            <div className="w-2 h-2 bg-fuchsia-400 animate-ping" />
-                          </div>
-                          <p className="text-2xl font-bold text-fuchsia-50 leading-tight tracking-tight text-right">
-                            <CascadeTypewriter text={msg.text} />
-                          </p>
+                  </div>
+                ) : (
+                  <div className="col-start-4 col-span-2 flex justify-end pointer-events-auto">
+                    <div className="glass-neural-user scanline px-10 py-6">
+                      <DataStream />
+                      <div className="relative z-10">
+                        <div className="flex items-center justify-end gap-3 mb-2 opacity-40">
+                          <span className="text-[10px] tracking-[0.2em] text-fuchsia-400 font-bold uppercase">User_Input</span>
+                          <div className="w-2 h-2 bg-fuchsia-400 animate-ping" />
                         </div>
+                        <p className="text-2xl font-bold text-fuchsia-50 leading-tight tracking-tight text-right">
+                          <CascadeTypewriter text={msg.text} />
+                        </p>
                       </div>
                     </div>
-                  )}
-                </motion.div>
-              );
-            })}
+                  </div>
+                )}
+              </motion.div>
+            ))}
           </AnimatePresence>
         </div>
       </motion.div>

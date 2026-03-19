@@ -13,6 +13,10 @@ import asyncio
 from enum import Enum
 from typing import Optional
 from wakefusion.config import get_config
+try:
+    import websockets
+except ImportError:
+    websockets = None  # 如果未安装，设置为None
 # SystemState枚举已删除，改用布尔标志位
 
 # 配置日志
@@ -129,7 +133,7 @@ class CoreServer:
         
         # 🌟 保底机制：30秒交流上限时间（防止视觉受损和极度噪音环境下数据无限制传输）
         self._listening_start_time: float = 0.0  # 进入LISTENING状态的时间戳
-        self._max_listening_duration: float = 30.0  # 最大监听时长（秒）
+        self._max_listening_duration: float = self.conversation_config.long_sentence_timeout_s  # 最大监听时长（秒），使用长句保底超时配置
         
         # 对话轮次和唤醒路径管理已删除（简化架构，不再需要）
         
@@ -435,12 +439,17 @@ class CoreServer:
                 # 🌟 修复：直接尝试发送ping，如果连接已关闭会抛出异常
                 try:
                     await websocket.send(json.dumps({"type": "ping"}))
-                except websockets.exceptions.ConnectionClosed:
-                    # 连接已关闭，退出循环
-                    break
-                except AttributeError:
-                    # websocket对象可能已被销毁，退出循环
-                    break
+                except Exception as e:
+                    # 检查是否是连接关闭异常（兼容不同版本的websockets）
+                    if "ConnectionClosed" in str(type(e).__name__) or "ConnectionClosed" in str(e):
+                        # 连接已关闭，退出循环
+                        break
+                    # 检查是否是AttributeError（websocket对象可能已被销毁）
+                    if isinstance(e, AttributeError):
+                        # websocket对象可能已被销毁，退出循环
+                        break
+                    # 其他异常继续抛出
+                    raise
         except asyncio.CancelledError:
             # 任务被取消（正常情况，当连接关闭时）
             pass
@@ -481,6 +490,22 @@ class CoreServer:
                 "type": "chat_reply",
                 "text": data.get("text", "")
             })
+        elif msg_type == "asr":
+            # 🌟 路由：转发 ASR 字幕至前端
+            text = data.get("text", "")
+            logger.info(f"📝 [路由] 转发 ASR 字幕至前端: {text}")
+            self._forward_to_ui({
+                "type": "subtitle_user",
+                "text": text
+            })
+        elif msg_type == "text":
+            # 🌟 路由：转发 AI 字幕至前端
+            text = data.get("text", "")
+            logger.info(f"📝 [路由] 转发 AI 字幕至前端: {text}")
+            self._forward_to_ui({
+                "type": "subtitle_ai",
+                "text": text
+            })
         elif msg_type == "stop_tts":
             # 停止TTS合成
             logger.info("🛑 收到stop_tts消息，清空播放队列和预缓冲区")
@@ -510,21 +535,31 @@ class CoreServer:
             # 不要立即切换状态！设置排空标志
             self._wait_for_audio_drain = True
             
-            # 发送STOP_LIP_SYNC给视觉模块
-            if self._vision_ctrl_pub_socket:
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
-                except Exception as e:
-                    logger.debug(f"发送STOP_LIP_SYNC失败（已忽略）: {e}")
+            # 🌟 修复：已删除发送STOP_LIP_SYNC给视觉模块的代码，防止误杀用户唇动检测
         elif msg_type == "interrupt":
             # 服务端interrupt指令
             session_id = data.get("session_id")
             if self.is_playing_tts:
                 logger.warning(f"⚠️ 收到服务端interrupt指令 (session_id: {session_id})")
                 self._handle_hard_cutoff("server_interrupt")
+                # 清空字幕
+                self._forward_to_ui({"type": "subtitle_clear"})
             else:
                 logger.debug(f"收到服务端interrupt指令，但当前未在播放TTS，忽略")
+        elif msg_type == "stop":
+            reason = data.get("reason", "server_stop")
+            logger.warning(f"🛑 [最高指令] 收到服务端 stop 指令 (原因: {reason})")
+            logger.warning(f"🚨 强制终止：立即停止播报，并完全退出唤醒交互状态！")
+            
+            # 1. 强行停止当前的 TTS 播报和嘴型动作
+            self._stop_tts_playback()
+            
+            # 2. 清空字幕
+            self._forward_to_ui({"type": "subtitle_clear"})
+            
+            # 3. 彻底退出交互模式（自动通知底层断开推流、重置冷却，阈值恢复 0.9）
+            if self.is_interactive_mode:
+                self._exit_interactive_mode()
         elif msg_type == "pong":
             # Ping响应
             pass
@@ -566,14 +601,7 @@ class CoreServer:
             # 如果当前不在TTS播放状态，开始TTS播放
             if not self.is_playing_tts:
                 self._start_tts_playback()
-            # 向视觉模块发送START_LIP_SYNC消息
-            if self._vision_ctrl_pub_socket:
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "START_LIP_SYNC"}, zmq.NOBLOCK)
-                    logger.info("🎬 已发送START_LIP_SYNC给视觉模块")
-                except Exception as e:
-                    logger.debug(f"发送START_LIP_SYNC失败（已忽略）: {e}")
+            # 🌟 修复：已删除发送START_LIP_SYNC给视觉模块的代码，防止误杀用户唇动检测
         
         # 预缓冲机制
         if self._is_prebuffering:
@@ -724,7 +752,7 @@ class CoreServer:
         with self._state_lock:
             # 1. 清空播放队列
             self.clear_playback_queue()
-            
+        
             # 2. 生成新session_id
             self._current_audio_session_id = str(uuid.uuid4())
             
@@ -757,15 +785,9 @@ class CoreServer:
                 except Exception as e:
                     logger.error(f"发送interrupt消息失败: {e}")
             
-            # 9. 同步停止视觉唇动
-            if self._vision_ctrl_pub_socket:
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
-                except Exception:
-                    pass
+            # 9. 🌟 修复：已删除同步停止视觉唇动的代码，防止误杀用户唇动检测
                     
-            logger.info("✅ 硬打断完成，启动冷却期")
+        logger.info("✅ 硬打断完成，启动冷却期")
     
     def _is_in_cooldown(self) -> bool:
         """检查是否在冷却期内"""
@@ -911,8 +933,18 @@ class CoreServer:
             self.is_playing_tts = False
             self._current_wake_path = "unknown"
             
-            logger.info("状态转换: 退出交互模式，通知底层结束推流")
+            logger.info("状态转换: 退出交互模式，通知底层结束推流并关闭唇动检测")
             self._send_stop_streaming_command()
+            
+            # 🌟 新增：休眠时关闭唇动检测，大幅节省 CPU/GPU 算力
+            if getattr(self, '_vision_ctrl_pub_socket', None):
+                try:
+                    with self._vision_ctrl_lock:
+                        self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
+                    logger.info("🛑 交互结束，已通知视觉模块休眠唇动检测")
+                except Exception:
+                    pass
+            
             # 退出交互时才重置底层唤醒冷却
             self._send_reset_cooldown_command()
             
@@ -939,6 +971,7 @@ class CoreServer:
             self._last_lip_active_time = time.time()  # 重置唇动计时器
             if hasattr(self, '_last_vad_false_time'):
                 self._last_vad_false_time = 0.0  # 重置VAD False时间戳
+            self._consecutive_macro_timeouts = 0  # 重置连续发呆计数器
             
             # 记录进入交互模式的时间
             self._listening_start_time = time.time()
@@ -957,6 +990,15 @@ class CoreServer:
             if self._interactive_timeout_thread is None or not self._interactive_timeout_thread.is_alive():
                 self._interactive_timeout_thread = threading.Thread(target=self._interactive_timeout_checker, daemon=True)
                 self._interactive_timeout_thread.start()
+            
+            # 🌟 新增：唤醒时开启唇动检测，用于防伪和微观截断
+            if getattr(self, '_vision_ctrl_pub_socket', None):
+                try:
+                    with self._vision_ctrl_lock:
+                        self._vision_ctrl_pub_socket.send_json({"event": "START_LIP_SYNC"}, zmq.NOBLOCK)
+                    logger.info("🎬 唤醒成功，已通知视觉模块全速开启唇动检测！")
+                except Exception as e:
+                    logger.debug(f"发送START_LIP_SYNC失败（已忽略）: {e}")
             
             self.is_interactive_mode = True
             
@@ -1065,10 +1107,11 @@ class CoreServer:
             logger.info("状态转换: TTS播放结束")
             self.is_playing_tts = False
             
-            # 🌟 核心修复：开启 0.8 秒的绝对物理防抖时间！
+            # 🌟 核心修复：开启绝对物理防抖时间！
             # 屏蔽这段时间内的任何 VAD 波动和硬打断，防止自己录到自己的尾音
-            self._ignore_audio_until = time.time() + 0.8
-            logger.info(f"🛡️ 激活物理防抖护盾：0.8秒内忽略所有音频输入（直到 {self._ignore_audio_until:.2f}）")
+            debounce_window = self.conversation_config.lip_recent_window_s
+            self._ignore_audio_until = time.time() + debounce_window
+            logger.info(f"🛡️ 激活物理防抖护盾：{debounce_window}秒内忽略所有音频输入（直到 {self._ignore_audio_until:.2f}）")
             
             # 如果仍在交互模式，继续监听（等待用户继续说话）
             if self.is_interactive_mode:
@@ -1106,7 +1149,8 @@ class CoreServer:
         if getattr(self, '_vision_ctrl_pub_socket', None):
             try:
                 with self._vision_ctrl_lock:
-                    self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
+                    # 🌟 修复：已删除发送STOP_LIP_SYNC给视觉模块的代码，防止误杀用户唇动检测
+                    pass
             except Exception:
                 pass
                 
@@ -1236,6 +1280,11 @@ class CoreServer:
         distance_m = vision_data.get("distance_m")
         is_talking = vision_data.get("is_talking", False)
         
+        # 🌟 增加视觉流实时诊断日志，让用户看清摄像头每秒的真实判定
+        if not hasattr(self, '_diag_last_lip') or self._diag_last_lip != is_talking:
+            logger.info(f"👀 [视觉实时诊断] 摄像头捕捉到 -> {'👄 正在动嘴' if is_talking else '😶 嘴唇静止'}")
+            self._diag_last_lip = is_talking
+        
         # 如果 distance_m 不在顶层，尝试从 faces 中获取
         if distance_m is None and faces:
             for face in faces:
@@ -1310,9 +1359,12 @@ class CoreServer:
                     self._send_threshold_command(self.audio_threshold_config.visual_wake)
                     self._is_vision_wake_active = True
                     logger.info(f"👁️ 视觉降维打击激活，阈值已降至{self.audio_threshold_config.visual_wake:.2f}")
+            
+            # 🌟 注意：如果防抖时间还没到，这里没有 else，什么都不做，安静等待 200ms 走完
+            
         else:
-            # 不满足视觉唤醒条件
-            # 🌟 修复：distance_m 已在方法开头提取，这里不再重复提取
+            # 🌟 修复缩进：这里必须和最外层的 if vision_wake_candidate 对齐！
+            # 不满足视觉唤醒条件（人不在镜头前）
             
             # 1. 目标丢失，立即中断并清理任何"进入防抖"的状态和倒计时
             self._vision_wake_debounce_active = False
@@ -1331,16 +1383,14 @@ class CoreServer:
                     logger.info(f"👁️ 视觉降维打击结束，阈值已恢复至{self.audio_threshold_config.default:.2f}")
                     self._is_vision_wake_active = False
                     
-                    # 2. 🌟 核心修复：只对"视觉降维打击"唤醒的会话执行强制挂断！
-                    # 如果是"纯语音唤醒"，赋予绝对视觉免疫，不受人脸离开画面的干扰
+                    # 2. 只对"视觉降维打击"唤醒的会话执行强制挂断
                     if self.is_interactive_mode and getattr(self, '_current_wake_path', 'unknown') == "视觉降维打击":
-                        # 🌟 落实蓝图：矢值区间 [0.4, 4.5]。如果在区间外或完全丢失深度，才触发斩断
-                        # 使用在方法开头提取的 distance_m（避免 UnboundLocalError）
-                        if distance_m is None or not (0.4 <= distance_m <= 4.5):
-                            logger.info(f"🛑 视觉降维唤醒：用户离开 [0.4m, 4.5m] 绝对安全区 (当前 {distance_m}m)，触发视觉斩断，终止唤醒！")
+                        min_dist, max_dist = self.vision_wake_config.distance_range
+                        if distance_m is None or not (min_dist <= distance_m <= max_dist):
+                            logger.info(f"🛑 视觉降维唤醒：用户离开 [{min_dist}m, {max_dist}m] 绝对安全区 (当前 {distance_m}m)，触发视觉斩断，终止唤醒！")
                             self._exit_interactive_mode()
                         else:
-                            logger.info(f"🛡️ 视觉降维唤醒：用户虽丢失人脸，但仍在 {distance_m}m 处，处于 [0.4, 4.5] 安全区间内，保持唤醒状态！")
+                            logger.info(f"🛡️ 视觉降维唤醒：用户虽丢失人脸，但仍在 {distance_m}m 处，处于 [{min_dist}m, {max_dist}m] 安全区间内，保持唤醒状态！")
         
         # ========== 视觉区间判断（用于视觉斩断） ==========
         vision_target_present = self._check_vision_target_present(faces)
@@ -1397,10 +1447,7 @@ class CoreServer:
             with self._state_lock:
                 self.is_vision_target_present = True
         
-        # ========== 交互模式下，视觉检测到用户说话时也标记为已开口 ==========
-        if self.is_interactive_mode and is_talking and not self._user_has_spoken:
-            self._user_has_spoken = True
-            logger.info("👄 [视觉数据] 检测到用户说话（视觉确认），标记为已开口")
+        # 🌟 修复：已删除视觉状态机抢跑代码，让 _user_has_spoken 的修改权完全交还给 _process_audio_data，保证一定能生成 trace_id
     
     def _process_audio_data(self, metadata: dict, audio_binary: bytes):
         """处理音频数据"""
@@ -1408,13 +1455,26 @@ class CoreServer:
         
         # 🛡️ 护盾拦截：如果在无敌时间内，直接丢弃 VAD 和 打断 信号！
         if current_time < getattr(self, '_ignore_audio_until', 0.0):
-            # 忽略刚开麦时的物理噪音
-            logger.debug(f"🛡️ 物理防抖护盾生效中，忽略音频输入（剩余 {self._ignore_audio_until - current_time:.2f}秒）")
+            # 🌟 核心修复：护盾期间同步刷新所有静音计时器，防止刚出护盾就瞬间超时！
+            self._vad_silence_start = current_time
+            self._lip_silence_start = current_time
+            if self._interactive_start_time:
+                self._interactive_start_time = current_time
+            self._last_speech_time = current_time
+            self._last_lip_active_time = current_time
+            logger.debug(f"🛡️ 物理防抖护盾生效中，忽略音频输入（剩余 {self._ignore_audio_until - current_time:.2f}秒），已冻结所有计时器")
             return
         
         # 🌟 修复声学反馈问题：在TTS播放状态下，忽略所有音频输入（除了唤醒词）
         # 防止TTS播放的音频被麦克风拾取后误识别为ASR输入
         if self.is_playing_tts:
+            # 🌟 核心修复：只冻结静音超时，绝对不伪造用户的唇动时间！
+            self._vad_silence_start = current_time
+            self._lip_silence_start = current_time
+            if self._interactive_start_time:
+                self._interactive_start_time = current_time
+            self._last_speech_time = current_time
+            
             # 在TTS播放状态下，只处理唤醒词（用于硬打断），不处理VAD，不转发音频
             wake_word = metadata.get("wake_word", {})
             if wake_word.get("detected", False):
@@ -1450,37 +1510,63 @@ class CoreServer:
         vad = metadata.get("vad", False)
         wake_word = metadata.get("wake_word", {})
         
-        # 🌟 核心修复：直接使用真实的音频 vad，防连击只依赖 _user_has_spoken
-        _safe_vad = vad
+        # =================================================================
+        # 第一阶段：极其严谨的"开门"判定（防伪验证）
+        # =================================================================
+        # 记录最后一次看到真实唇动的时间
+        lip_sync = getattr(self, '_latest_vision_is_talking', False)
+        if lip_sync:
+            self._last_lip_active_time = current_time
+        elif not hasattr(self, '_last_lip_active_time'):
+            self._last_lip_active_time = 0
+            
+        wake_path = getattr(self, '_current_wake_path', 'unknown')
         
-        # 🌟 traceID生成逻辑：只有在交互模式下，trace_id==None，且VAD从False变True时生成
+        # 门槛设定：纯语音只要声音；视觉降维必须【声音 + 最近2.0秒内有唇动】
+        is_valid_speech_start = vad
+        if wake_path == "视觉降维打击":
+            # 🌟 核心修复：放宽到 2.0 秒，抵抗嘴唇检测的瞬间闪烁误差
+            lip_window = getattr(self.conversation_config, 'lip_recent_window_s', 2.0)
+            # 如果配置值小于2.0，使用2.0作为最小容错窗口
+            if lip_window < 2.0:
+                lip_window = 2.0
+            recent_lip_activity = (current_time - self._last_lip_active_time) < lip_window
+            is_valid_speech_start = vad and recent_lip_activity
+
+        # 一旦通过防伪验证，无条件信任，生成 TraceID！
         if self.is_interactive_mode and self._current_trace_id is None:
-            if _safe_vad and not self._last_vad_state and not self._user_has_spoken:
-                # VAD从False变True，生成新traceID
-                self._user_has_spoken = True
-                self._talking_confirm_count = 0
-                self._current_trace_id = str(uuid.uuid4())
-                trace_timestamp = time.time()
-                logger.info(f"🆕 新对话轮次开始，生成traceId: {self._current_trace_id}")
-                
-                # 发送Text Frame（metadata）
-                if self._ws_connected and self._ws_client and self._ws_loop:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._send_websocket_text({
-                                "type": "audio_start",
-                                "trace_id": self._current_trace_id,
-                                "timestamp": trace_timestamp,
-                                "sample_rate": 16000
-                            }),
-                            self._ws_loop
-                        )
-                    except Exception as e:
-                        logger.error(f"发送audio_start消息失败: {e}")
-                
-                # 🌟 修复2：音频回捞的异步管道机制
-                # 由于我们在免唤醒期间始终保持推流，这里不需要再发送 start_streaming
-        
+            if is_valid_speech_start and not self._user_has_spoken:
+                if self._interactive_start_time and (current_time - self._interactive_start_time) < 0.2:
+                    pass  # 极短的防连击保护
+                else:
+                    self._user_has_spoken = True
+                    self._consecutive_macro_timeouts = 0  # 🌟 只要有真实开口，立刻清零发呆计数
+                    self._talking_confirm_count = 0
+                    
+                    # 🌟🌟🌟 新增核心修复：开门瞬间，强制重置所有静默计时器！🌟🌟🌟
+                    # 彻底阻断旧的静默时间被继承到微观状态中，给用户完整的 1.5 秒输出窗口
+                    self._vad_silence_start = current_time
+                    self._lip_silence_start = current_time
+                    
+                    self._current_trace_id = str(uuid.uuid4())
+                    trace_timestamp = time.time()
+                    logger.info(f"🗣️ 检测到用户真实开口(双模防伪通过)，生成 traceId: {self._current_trace_id}，已完全交由微观接管！")
+                    
+                    # 发送Text Frame（metadata）
+                    if self._ws_connected and self._ws_client and self._ws_loop:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._send_websocket_text({
+                                    "type": "audio_start",
+                                    "trace_id": self._current_trace_id,
+                                    "timestamp": trace_timestamp,
+                                    "sample_rate": 16000
+                                }),
+                                self._ws_loop
+                            )
+                        except Exception as e:
+                            logger.error(f"发送audio_start消息失败: {e}")
+
         # 更新VAD状态
         prev_vad_state = self._last_vad_state
         self._last_vad_state = vad
@@ -1490,98 +1576,111 @@ class CoreServer:
             self._last_vad_false_time = current_time
             logger.debug(f"🔄 VAD从True变为False，重置90秒倒计时")
         
+        # ⬇️⬇️⬇️ 核心修复：必须与上方 if 平级！ ⬇️⬇️⬇️
         # 🌟 修复状态机漏风：只有在交互模式下，才允许修改 _user_has_spoken！
         if self.is_interactive_mode:
-            # 🌟 核心修复：更新静音/发声计时器（使用真实的 vad）
+            # =================================================================
+            # 第二阶段：更新静音计时器（仅追踪真实声音和唇动）
+            # =================================================================
             if vad:
-                # 只要底层听到声音，静音起点就永远是"现在"，绝不累加！
                 self._vad_silence_start = current_time
                 self._last_speech_time = current_time
-                self._vad_speech_count += 1
-                self._vad_silence_count = 0
-                
-                # 必须连续2次（0.4秒）检测到人声，才认定为真语音，避免瞬间噪音（如咳嗽、碰撞）打断1.5秒计时
-                if self._vad_speech_count >= 2:
-                    self._last_vad_time = current_time
-                    if not self._user_has_spoken:
-                        self._user_has_spoken = True
-                        logger.info("🗣️ 检测到用户真实开口，切换为1.5秒微观截断模式")
             elif not self._vad_silence_start:
-                # 只有从说话变成不说话的瞬间，才记录静音的起始点
                 self._vad_silence_start = current_time
-            else:
-                self._vad_silence_count += 1
-                self._vad_speech_count = 0
-            
-            # 🌟 核心修复：更新唇动静音计时器（从视觉数据中获取）
-            # 注意：lip_sync 状态来自 _latest_vision_is_talking（由 _process_vision_data 更新）
-            lip_sync = getattr(self, '_latest_vision_is_talking', False)
+
             if lip_sync:
-                # 只要嘴在动，唇动静音起点就永远是"现在"
                 self._lip_silence_start = current_time
-            else:
-                # 只有从动嘴变成不动嘴的瞬间，才记录静音的起始点
-                if self._lip_silence_start is None:
-                    self._lip_silence_start = current_time
-            
-            # 🌟 修复1：纯事件驱动的VAD超时检查（在每个音频帧到达时检查）
-            # 将原来 _vad_timeout_checker 线程中的逻辑移到这里
+            elif not self._lip_silence_start:
+                self._lip_silence_start = current_time
+
             # 🌟 核心修复：TTS播放期间暂停所有超时倒计时
             if self.is_playing_tts:
                 # 如果正在播放声音，暂停所有的超时倒计时
                 self._last_speech_time = current_time
                 return  # 不进行超时检查
             
-            # ========== 超时与断流判定 ==========
-            now = current_time
-            # 分离静音计算，防止某一个为 None 导致无法进入判定
-            vad_silence_time = now - self._vad_silence_start if self._vad_silence_start else 0
-            lip_silence_time = now - self._lip_silence_start if self._lip_silence_start else 0
-            wake_path = getattr(self, '_current_wake_path', 'unknown')
-            
-            trigger_cut = False
-            cut_reason = ""
-            
-            # ========== 1. 宏观超时（唤醒后发呆/误唤醒） ==========
-            if wake_path == "纯语音唤醒" and self._vad_silence_start and vad_silence_time >= 5.0:
-                trigger_cut = True
-                cut_reason = "5s纯语音宏观超时 (仅无声音)"
-            # 🌟 视觉模式下，宏观超时完全抛弃声音，只看唇动
-            elif wake_path == "视觉降维打击" and self._lip_silence_start and lip_silence_time >= 5.0:
-                trigger_cut = True
-                cut_reason = "5s单模态宏观超时 (无视声音，纯看唇动)"
+            # =================================================================
+            # 第三阶段：极其严格的 宏观/微观 隔离截断
+            # =================================================================
+            if self._vad_silence_start and self._lip_silence_start:
+                now = current_time
+                vad_silence_time = now - self._vad_silence_start if self._vad_silence_start else 0
+                lip_silence_time = now - self._lip_silence_start if self._lip_silence_start else 0
                 
-            # ========== 2. 微观超时（用户说完指令） ==========
-            elif self._current_trace_id is not None:
-                if wake_path == "纯语音唤醒" and self._vad_silence_start and vad_silence_time >= 1.5:
+                # 从配置读取参数
+                micro_limit = self.conversation_config.vad_fast_cutoff_sec
+                macro_limit = self.conversation_config.vad_silence_timeout_default_sec if wake_path == "纯语音唤醒" else self.conversation_config.vad_silence_timeout_visual_sec
+                
+                trigger_cut = False
+                cut_reason = ""
+                
+                # 🛡️ 状态 A：已经开口（有单号） -> 走微观关门
+                if self._current_trace_id is not None:
+                    if wake_path == "纯语音唤醒" and vad_silence_time >= micro_limit:
+                        trigger_cut = True
+                        cut_reason = f"{micro_limit}s纯语音微观超时"
+                    elif wake_path == "视觉降维打击":
+                        # 🌟 微观 OR 逻辑：只要声音停了，或者嘴巴闭上了，立刻关门！（极速响应，抗噪）
+                        if vad_silence_time >= micro_limit or lip_silence_time >= micro_limit:
+                            trigger_cut = True
+                            cut_reason = f"{micro_limit}s单模态微观超时 (声音或唇动静默)"
+                        
+                # 👻 状态 B：根本没开口（没单号） -> 走宏观发呆
+                elif self._current_trace_id is None:
+                    if wake_path == "纯语音唤醒" and vad_silence_time >= macro_limit:
+                        trigger_cut = True
+                        cut_reason = f"{macro_limit}s纯语音宏观发呆"
+                    elif wake_path == "视觉降维打击":
+                        # 🌟 宏观 OR 逻辑：只要有一个静默 5 秒，就算发呆（不怕环境噪音咬死VAD）
+                        if vad_silence_time >= macro_limit or lip_silence_time >= macro_limit:
+                            trigger_cut = True
+                            cut_reason = f"{macro_limit}s视觉宏观发呆 (声音或唇动已静默)"
+
+                # ⚠️ 状态 C：30秒长句兜底（仅限有单号的情况下兜底长语音）
+                if self._current_trace_id is not None and self._interactive_start_time and (now - self._interactive_start_time) >= self.conversation_config.long_sentence_timeout_s:
                     trigger_cut = True
-                    cut_reason = f"1.5s纯语音微观超时 (vad={vad_silence_time:.2f}s)"
-                # 🌟 视觉模式下，微观超时完全抛弃声音，只要嘴闭上 1.5 秒就切断
-                elif wake_path == "视觉降维打击" and self._lip_silence_start and lip_silence_time >= 1.5:
-                    trigger_cut = True
-                    cut_reason = f"1.5s单模态微观超时 (无视声音，纯看唇动 lip={lip_silence_time:.2f}s)"
-                
-            # ========== 3. 30秒长句保底 ==========
-            elif self._interactive_start_time and (now - self._interactive_start_time) >= 30.0:
-                trigger_cut = True
-                cut_reason = "30s长句保底超时"
-                
-            if trigger_cut:
-                # 宏观发呆也要"视为进行一次对话"
-                if self._current_trace_id is None:
-                    self._current_trace_id = str(uuid.uuid4())
-                    logger.info(f"👻 宏观发呆触发对话，生成占位 traceId: {self._current_trace_id}")
+                    cut_reason = f"{self.conversation_config.long_sentence_timeout_s}s长句保底超时"
+
+                # 执行截断动作
+                if trigger_cut:
+                    logger.info(f"✂️ 触发 VAD 句子截断: {cut_reason}")
                     
-                logger.info(f"✂️ 触发 VAD 句子截断: {cut_reason}")
-                self._handle_vad_end()
-                
-                # 彻底重置句子级状态
-                self._user_has_spoken = False
-                self._vad_silence_start = now
-                self._lip_silence_start = now
-                self._talking_confirm_count = 0
-                self._interactive_start_time = now
-                return  # 不再处理后续音频
+                    if self._current_trace_id is None:
+                        # 没开口的宏观超时：累加次数，本地丢弃
+                        self._consecutive_macro_timeouts += 1
+                        logger.info(f"👻 检测到幽灵音频或发呆，本地丢弃 (连续发呆次数: {self._consecutive_macro_timeouts}/6)")
+                        
+                        if self._ws_connected and self._ws_client and self._ws_loop:
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    self._send_websocket_text({
+                                        "type": "audio_cancel",
+                                        "reason": "macro_timeout_ghost_audio"
+                                    }),
+                                    self._ws_loop
+                                )
+                            except Exception as e:
+                                logger.error(f"发送audio_cancel消息失败: {e}")
+                        
+                        # 🌟 核心修复：连续6次发呆，仅关闭持续拾音，绝对不碰阈值！
+                        if self._consecutive_macro_timeouts >= 6:
+                            logger.warning("🛑 连续 6 次发呆，主动结束持续拾音。阈值保持不变，完全交由视觉模块管控！")
+                            with self._state_lock:
+                                self.is_interactive_mode = False
+                                self._send_stop_streaming_command()
+                                self._report_device_state("idle")
+                            return  # 直接退出，等待下一次真实唤醒
+                    else:
+                        # 真正开口过的话：正常发送结束标志
+                        self._handle_vad_end()
+                    
+                    # 彻底重置状态
+                    self._user_has_spoken = False
+                    self._vad_silence_start = now
+                    self._lip_silence_start = now
+                    self._talking_confirm_count = 0
+                    self._interactive_start_time = now
+                    return  # 不再处理后续音频
         else:
             # 🌟 修复：非交互模式下，不更新 VAD 状态变量，防止状态泄漏
             # 但需要重置计数器，避免状态残留
