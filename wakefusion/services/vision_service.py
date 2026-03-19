@@ -93,19 +93,7 @@ class VisionService:
         vision_pub_port = self.zmq_config.vision_pub_port
         self._zmq_pub_socket.bind(f"tcp://127.0.0.1:{vision_pub_port}")
         vision_logger.info(f"ZMQ PUB Socket bound to tcp://127.0.0.1:{vision_pub_port}")
-        
-        # 初始化 ZMQ SUB Socket（接收Core Server的控制消息）
-        self._vision_ctrl_sub_socket = self.zmq_context.socket(zmq.SUB)
-        vision_ctrl_pub_port = self.zmq_config.vision_ctrl_pub_port
-        self._vision_ctrl_sub_socket.connect(f"tcp://127.0.0.1:{vision_ctrl_pub_port}")
-        self._vision_ctrl_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # 订阅所有消息
-        vision_logger.info(f"ZMQ SUB Socket connected to tcp://127.0.0.1:{vision_ctrl_pub_port}")
-        
-        # 启动控制消息接收线程
-        self._ctrl_thread_stop = threading.Event()
-        self._ctrl_thread = threading.Thread(target=self._control_message_loop, daemon=True)
-        self._ctrl_thread.start()
-        
+
         # 视觉唤醒状态机已移除，业务逻辑移至core_server
         
         # 保留图像发送功能（UDP图像端口可保留，或后续讨论）
@@ -270,39 +258,6 @@ class VisionService:
                 # 发送缓冲满或临时错误：丢包即可（实时视频允许）
                 break
 
-    def _control_message_loop(self):
-        """控制消息接收循环（接收Core Server的控制消息）"""
-        vision_logger.info("控制消息接收线程已启动")
-        while not self._ctrl_thread_stop.is_set():
-            try:
-                # 使用非阻塞接收，带超时
-                try:
-                    message = self._vision_ctrl_sub_socket.recv_json(zmq.NOBLOCK)
-                    event = message.get("event")
-                    
-                    if event == "START_LIP_SYNC":
-                        vision_logger.info("🎬 收到START_LIP_SYNC，启动口型同步")
-                        # 通知lip_detector开始检测
-                        if self.lip_detector:
-                            self.lip_detector.start_sync()
-                    elif event == "STOP_LIP_SYNC":
-                        vision_logger.info("🛑 收到STOP_LIP_SYNC，停止口型同步")
-                        # 通知lip_detector停止检测
-                        if self.lip_detector:
-                            self.lip_detector.stop_sync()
-                    else:
-                        vision_logger.debug(f"收到未知控制事件: {event}")
-                except zmq.Again:
-                    # 没有消息，继续等待
-                    time.sleep(0.1)
-                except Exception as e:
-                    vision_logger.error(f"处理控制消息异常: {e}")
-                    time.sleep(0.1)
-            except Exception as e:
-                vision_logger.error(f"控制消息循环异常: {e}")
-                time.sleep(0.1)
-        vision_logger.info("控制消息接收线程已退出")
-    
     def _image_sender_loop(self):
         """后台线程：从队列取帧，做 JPEG 压缩 + UDP 发送。"""
         while not self._img_thread_stop.is_set():
@@ -1149,9 +1104,6 @@ class VisionService:
             cv2.destroyAllWindows()
             # 关闭ZMQ socket
             try:
-                self._ctrl_thread_stop.set()
-                if hasattr(self, '_vision_ctrl_sub_socket'):
-                    self._vision_ctrl_sub_socket.close()
                 self._zmq_pub_socket.close()
                 self.zmq_context.term()
             except Exception:

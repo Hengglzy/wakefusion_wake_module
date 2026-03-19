@@ -936,15 +936,6 @@ class CoreServer:
             logger.info("状态转换: 退出交互模式，通知底层结束推流并关闭唇动检测")
             self._send_stop_streaming_command()
             
-            # 🌟 新增：休眠时关闭唇动检测，大幅节省 CPU/GPU 算力
-            if getattr(self, '_vision_ctrl_pub_socket', None):
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
-                    logger.info("🛑 交互结束，已通知视觉模块休眠唇动检测")
-                except Exception:
-                    pass
-            
             # 退出交互时才重置底层唤醒冷却
             self._send_reset_cooldown_command()
             
@@ -990,15 +981,6 @@ class CoreServer:
             if self._interactive_timeout_thread is None or not self._interactive_timeout_thread.is_alive():
                 self._interactive_timeout_thread = threading.Thread(target=self._interactive_timeout_checker, daemon=True)
                 self._interactive_timeout_thread.start()
-            
-            # 🌟 新增：唤醒时开启唇动检测，用于防伪和微观截断
-            if getattr(self, '_vision_ctrl_pub_socket', None):
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "START_LIP_SYNC"}, zmq.NOBLOCK)
-                    logger.info("🎬 唤醒成功，已通知视觉模块全速开启唇动检测！")
-                except Exception as e:
-                    logger.debug(f"发送START_LIP_SYNC失败（已忽略）: {e}")
             
             self.is_interactive_mode = True
             
@@ -1144,15 +1126,6 @@ class CoreServer:
         # 更新session以屏蔽网络管道里的残余音频
         self._current_audio_session_id = str(uuid.uuid4())
         self._binary_frame_shield_until = time.time() + 0.5
-        
-        # 通知视觉模块闭嘴
-        if getattr(self, '_vision_ctrl_pub_socket', None):
-            try:
-                with self._vision_ctrl_lock:
-                    # 🌟 修复：已删除发送STOP_LIP_SYNC给视觉模块的代码，防止误杀用户唇动检测
-                    pass
-            except Exception:
-                pass
                 
         # 退出交互模式
         self._exit_interactive_mode(use_abort=True)
