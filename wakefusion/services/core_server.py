@@ -1253,7 +1253,7 @@ class CoreServer:
         distance_m = vision_data.get("distance_m")
         is_talking = vision_data.get("is_talking", False)
         
-        # 🌟 增加视觉流实时诊断日志，让用户看清摄像头每秒的真实判定
+        # 🌟 增加视觉流实时诊断日志（仅在状态改变时打印，避免刷屏）
         if not hasattr(self, '_diag_last_lip') or self._diag_last_lip != is_talking:
             logger.info(f"👀 [视觉实时诊断] 摄像头捕捉到 -> {'👄 正在动嘴' if is_talking else '😶 嘴唇静止'}")
             self._diag_last_lip = is_talking
